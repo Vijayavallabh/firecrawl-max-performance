@@ -41,12 +41,6 @@ x-common-env: &common-env
   MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-50}
   BROWSER_POOL_SIZE: ${BROWSER_POOL_SIZE:-20}
 
-  # --- LLM backend (Fireworks AI or any OpenAI-compatible) ---
-  OPENAI_API_KEY: ${OPENAI_API_KEY}
-  OPENAI_BASE_URL: ${OPENAI_BASE_URL}
-  MODEL_NAME: ${MODEL_NAME}
-  MODEL_NAME_FAST: ${MODEL_NAME_FAST}
-
   MODEL_EMBEDDING_NAME: ${MODEL_EMBEDDING_NAME}
   OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
   AUTUMN_SECRET_KEY: ${AUTUMN_SECRET_KEY}
@@ -100,6 +94,10 @@ services:
 
   api:
     <<: *common-service
+    # Keep the project's LLM configuration authoritative. Docker Compose
+    # otherwise lets a host OPENAI_API_KEY override the value in .env.
+    env_file:
+      - .env
     environment:
       <<: *common-env
       HOST: "0.0.0.0"

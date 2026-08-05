@@ -18,58 +18,8 @@ fi
 echo "Patching Firecrawl at: $FIRECRAWL_DIR"
 echo "========================================"
 
-# ── 1. Rate limiter: remove all rate limits ──────────────────────────
-echo "[1/8] Patching rate-limiter.ts (remove all rate limits)..."
-cat > "$FIRECRAWL_DIR/apps/api/src/services/rate-limiter.ts" << 'RATELIMITER'
-import { RateLimiterRedis } from "rate-limiter-flexible";
-import { config } from "../config";
-import { RateLimiterMode } from "../types";
-import Redis from "ioredis";
-import type { AuthCreditUsageChunk } from "../controllers/v1/types";
-
-export const redisRateLimitClient = new Redis(config.REDIS_RATE_LIMIT_URL!, {
-  enableAutoPipelining: true,
-});
-
-const createRateLimiter = (keyPrefix, points) =>
-  new RateLimiterRedis({
-    storeClient: redisRateLimitClient,
-    keyPrefix,
-    points,
-    duration: 60,
-  });
-
-const fallbackRateLimits: AuthCreditUsageChunk["rate_limits"] = {
-  crawl: 100000,
-  scrape: 100000,
-  search: 100000,
-  map: 100000,
-  extract: 100000,
-  preview: 100000,
-  extractStatus: 100000,
-  crawlStatus: 100000,
-  extractAgentPreview: 100000,
-  scrapeAgentPreview: 100000,
-  browser: 100000,
-  browserExecute: 100000,
-  browserReplay: 100000,
-  account: 100000,
-  supportAsk: 100000,
-  supportDocsSearch: 100000,
-  research: 100000,
-};
-
-export function getRateLimiter(
-  mode: RateLimiterMode,
-  rate_limits: AuthCreditUsageChunk["rate_limits"] | null,
-): RateLimiterRedis {
-  let rateLimit = rate_limits?.[mode] ?? fallbackRateLimits?.[mode] ?? 500;
-  if (mode === RateLimiterMode.Search || mode === RateLimiterMode.Scrape) {
-    rateLimit = Math.max(rateLimit, 100);
-  }
-  return createRateLimiter(`${mode}`, rateLimit);
-}
-RATELIMITER
+# ── 1. Rate limiter: keep the checkout-compatible implementation ──────
+echo "[1/8] Keeping the checkout-compatible rate-limiter implementation..."
 echo "  Done."
 
 # ── 2. Config: max CPU/RAM, longer worker timeouts, more retries ─────
@@ -421,8 +371,10 @@ echo "  Done."
 echo "[9/9] Patching dual-model support (gpt-oss-120b heavy + deepseek-v4-flash fast)..."
 
 # 9a. Add MODEL_NAME_FAST to config.ts
-sed -i '/MODEL_NAME: z.string().optional(),/a\  MODEL_NAME_FAST: z.string().optional(),' \
-  "$FIRECRAWL_DIR/apps/api/src/config.ts"
+if ! grep -q 'MODEL_NAME_FAST: z.string().optional(),' "$FIRECRAWL_DIR/apps/api/src/config.ts"; then
+  sed -i '/MODEL_NAME: z.string().optional(),/a\  MODEL_NAME_FAST: z.string().optional(),' \
+    "$FIRECRAWL_DIR/apps/api/src/config.ts"
+fi
 
 # 9b. Add getModelFast() to generic-ai.ts
 GENERIC_AI="$FIRECRAWL_DIR/apps/api/src/lib/generic-ai.ts"
@@ -454,8 +406,11 @@ sed -i 's/retryModel: getModel("gpt-4.1-mini", "openai"),/retryModel: getModelFa
 
 # 9d. Route diff.ts LLM diff to fast model
 DIFF_TS="$FIRECRAWL_DIR/apps/api/src/scraper/scrapeURL/transformers/diff.ts"
+if ! grep -q 'import { getModelFast }' "$DIFF_TS"; then
 sed -i 's/import { generateCompletions } from "\.\/llmExtract";/import { generateCompletions } from ".\/llmExtract";\nimport { getModelFast } from "..\/..\/..\/lib\/generic-ai";/' "$DIFF_TS"
 sed -i 's/previousWarning: document.warning,/previousWarning: document.warning,\n              model: getModelFast("gpt-4o-mini", "openai"),/' "$DIFF_TS"
+
+fi
 
 # 9e. Route Fire-0 extract fast tasks to getModelFast
 F0_LLM="$FIRECRAWL_DIR/apps/api/src/lib/extract/fire-0/llmExtract-f0.ts"
@@ -470,13 +425,18 @@ sed -i 's/model: getModel("gpt-4o-mini"),/model: getModelFast("gpt-4o-mini"),/' 
 
 # url-processor-f0
 F0_URL="$FIRECRAWL_DIR/apps/api/src/lib/extract/fire-0/url-processor-f0.ts"
-sed -i 's/import { getModel } from "..\/generic-ai";/import { getModel, getModelFast } from "..\/generic-ai";/' "$F0_URL"
+if ! grep -q 'import { getModelFast }' "$F0_URL"; then
+sed -i 's/import { getModel } from "..\/..\/generic-ai";/import { getModel, getModelFast } from "..\/..\/generic-ai";/' "$F0_URL"
+fi
 sed -i 's/model: getModel("gpt-4o-mini"),/model: getModelFast("gpt-4o-mini"),/' "$F0_URL"
 
 # reranker-f0
 F0_RERANK="$FIRECRAWL_DIR/apps/api/src/lib/extract/fire-0/reranker-f0.ts"
+if ! grep -q 'import { getModelFast }' "$F0_RERANK"; then
 sed -i 's/import { generateCompletions } from "..\/..\/..\/scraper\/scrapeURL\/transformers\/llmExtract";/import { generateCompletions } from "..\/..\/..\/scraper\/scrapeURL\/transformers\/llmExtract";\nimport { getModelFast } from "..\/..\/..\/lib\/generic-ai";/' "$F0_RERANK"
 sed -i 's/isExtractEndpoint: true,/isExtractEndpoint: true,\n            model: getModelFast("gpt-4o-mini", "openai"),/' "$F0_RERANK"
+
+fi
 
 # 9f. Route deep research queries/planning to fast model
 RESEARCH_MGR="$FIRECRAWL_DIR/apps/api/src/lib/deep-research/research-manager.ts"
@@ -497,7 +457,9 @@ sed -i 's/model: getModel("gpt-4o-mini", "openai"),/model: getModelFast("gpt-4o-
 
 # 9i. Route deterministic JSON to fast model via openai provider
 DJ_CLIENT="$FIRECRAWL_DIR/apps/api/src/lib/deterministicJson/llm/client.ts"
-sed -i 's/import { getModel } from "..\/generic-ai";/import { getModel, getModelFast } from "..\/generic-ai";/' "$DJ_CLIENT"
+if ! grep -q 'import { getModelFast }' "$DJ_CLIENT"; then
+sed -i 's/import { getModel } from "..\/..\/generic-ai";/import { getModel, getModelFast } from "..\/..\/generic-ai";/' "$DJ_CLIENT"
+fi
 sed -i 's/model: getModel(CODEGEN_MODEL, "vertex"),/model: getModelFast(CODEGEN_MODEL, "openai"),/' "$DJ_CLIENT"
 sed -i 's/model: getModel(ANCHOR_MODEL, "groq"),/model: getModelFast(ANCHOR_MODEL, "openai"),/' "$DJ_CLIENT"
 sed -i 's/model: getModel(LIGHT_MODEL, "groq"),/model: getModelFast(LIGHT_MODEL, "openai"),/' "$DJ_CLIENT"

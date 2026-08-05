@@ -7,6 +7,7 @@ import os
 import asyncio
 import xml.etree.ElementTree as ET
 from typing import Optional, List
+from urllib.parse import quote
 
 app = FastAPI(title="Firecrawl Research Proxy")
 
@@ -640,6 +641,191 @@ async def search_github(
         results = results[:k]
 
     return {"success": True, "results": results}
+
+
+def developer_github_query(
+    query: str,
+    repos: Optional[List[str]],
+    language: Optional[str],
+    topics: Optional[List[str]],
+    license_name: Optional[str],
+    min_stars: Optional[int],
+    max_stars: Optional[int],
+    archived: Optional[bool],
+    fork: Optional[bool],
+    skills: Optional[str],
+) -> str:
+    parts = [query.strip()]
+    for repo in repos or []:
+        if repo.strip():
+            parts.append(f"repo:{repo.strip()}")
+    if language:
+        parts.append(f"language:{language}")
+    for topic in topics or []:
+        if topic.strip():
+            parts.append(f"topic:{topic.strip()}")
+    if license_name:
+        parts.append(f"license:{license_name}")
+    if min_stars is not None:
+        parts.append(f"stars:>={min_stars}")
+    if max_stars is not None:
+        parts.append(f"stars:<={max_stars}")
+    if archived is not None:
+        parts.append(f"archived:{str(archived).lower()}")
+    if fork is not None:
+        parts.append(f"fork:{str(fork).lower()}")
+    if skills == "only":
+        parts.append("path:skills")
+    return " ".join(parts)
+
+
+async def github_json(client: httpx.AsyncClient, path: str, params: dict) -> dict:
+    try:
+        response = await client.get(
+            f"{GITHUB_BASE}{path}",
+            params=params,
+            headers=gh_headers(),
+        )
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        pass
+    return {}
+
+
+async def code_passage(client: httpx.AsyncClient, item: dict) -> str:
+    repository = (item.get("repository") or {}).get("full_name", "")
+    path = item.get("path", "")
+    if repository and path:
+        try:
+            response = await client.get(
+                f"{GITHUB_BASE}/repos/{repository}/contents/{quote(path, safe='/')}",
+                headers={**gh_headers(), "Accept": "application/vnd.github.raw"},
+            )
+            if response.status_code == 200 and response.text.strip():
+                return response.text[:2400]
+        except Exception:
+            pass
+    return f"{repository}/{path}".strip("/")
+
+
+@app.get("/v2/code/search")
+async def search_developer(
+    query: str = Query(..., min_length=1),
+    k: Optional[int] = Query(None, ge=1, le=100),
+    types: Optional[List[str]] = Query(None),
+    repos: Optional[List[str]] = Query(None),
+    sources: Optional[List[str]] = Query(None),
+    passages: Optional[int] = Query(None, ge=1, le=5),
+    language: Optional[str] = Query(None, min_length=1),
+    topic: Optional[List[str]] = Query(None),
+    license: Optional[str] = Query(None, min_length=1),
+    min_stars: Optional[int] = Query(None, ge=0),
+    max_stars: Optional[int] = Query(None, ge=0),
+    archived: Optional[bool] = Query(None),
+    fork: Optional[bool] = Query(None),
+    skills: Optional[str] = Query(None),
+):
+    """Provide a local developer-search surface using the GitHub API."""
+    limit = min(k or 10, 100)
+    requested_types = {value.lower() for value in (types or [])}
+    source_values = {value.lower() for value in (sources or [])}
+    github_requested = not source_values or "github" in source_values
+    include_code = not requested_types or "code" in requested_types
+    include_issues = not requested_types or bool(
+        requested_types & {"issue", "issues", "pull_request", "pr"}
+    )
+    include_repositories = not requested_types or bool(
+        requested_types & {"repository", "repo", "readme", "docs"}
+    )
+    if not github_requested:
+        return {"success": True, "results": []}
+
+    github_query = developer_github_query(
+        query,
+        repos,
+        language,
+        topic,
+        license,
+        min_stars,
+        max_stars,
+        archived,
+        fork,
+        skills,
+    )
+    search_limit = min(max(limit, 10), 100)
+    search_tasks = []
+    search_kinds = []
+    if include_code:
+        search_tasks.append(
+            ("code", "/search/code", {"q": github_query, "per_page": search_limit})
+        )
+        search_kinds.append("code")
+    if include_issues:
+        search_tasks.append(
+            ("issues", "/search/issues", {"q": github_query, "per_page": search_limit})
+        )
+        search_kinds.append("issues")
+    if include_repositories:
+        search_tasks.append(
+            (
+                "repositories",
+                "/search/repositories",
+                {"q": github_query, "per_page": search_limit},
+            )
+        )
+        search_kinds.append("repositories")
+
+    results = []
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        payloads = await asyncio.gather(
+            *(github_json(client, path, params) for _, path, params in search_tasks)
+        )
+        for kind, payload in zip(search_kinds, payloads):
+            items = payload.get("items", []) if isinstance(payload, dict) else []
+            if kind == "code":
+                passages_text = await asyncio.gather(
+                    *(code_passage(client, item) for item in items[:limit])
+                )
+                for item, passage in zip(items[:limit], passages_text):
+                    repository = (item.get("repository") or {}).get("full_name", "")
+                    path = item.get("path", "")
+                    results.append(
+                        {
+                            "id": f"github:code:{repository}:{path}",
+                            "type": "code",
+                            "title": f"{repository}/{path}".strip("/"),
+                            "url": item.get("html_url", ""),
+                            "passages": [{"text": passage}],
+                        }
+                    )
+            elif kind == "issues":
+                for item in items[:limit]:
+                    is_pr = "pull_request" in item
+                    body = (item.get("body") or item.get("title") or "").strip()
+                    results.append(
+                        {
+                            "id": f"github:{'pr' if is_pr else 'issue'}:{item.get('id', '')}",
+                            "type": "pull_request" if is_pr else "issue",
+                            "title": item.get("title", ""),
+                            "url": item.get("html_url", ""),
+                            "passages": [{"text": body[:2400]}],
+                        }
+                    )
+            else:
+                for item in items[:limit]:
+                    description = (item.get("description") or "").strip()
+                    results.append(
+                        {
+                            "id": f"github:repo:{item.get('id', '')}",
+                            "type": "repository",
+                            "title": item.get("full_name", ""),
+                            "url": item.get("html_url", ""),
+                            "passages": [{"text": description or item.get("name", "")}],
+                        }
+                    )
+
+    return {"success": True, "results": results[:limit]}
 
 
 async def find_passages(result: dict, work: dict, question: str, num_passages: int) -> list:

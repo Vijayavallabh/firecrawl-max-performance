@@ -2,8 +2,8 @@
 
 Complete self-hosting package for [Firecrawl](https://github.com/firecrawl/firecrawl) with:
 
-- **No rate limits** on any of the 13 working features
-- **Custom research service** (5 endpoints: search_papers, inspect_paper, read_paper, related_papers, search_github)
+- **No rate limits** on any of the 14 working features
+- **Custom research service** (6 endpoints: search_papers, inspect_paper, read_paper, related_papers, search_github, developer_search)
 - **SearXNG** meta-search backend (Google + Bing + DuckDuckGo + Wikipedia)
 - **Dual LLM model strategy** — heavy model (gpt-oss-120b) for extraction, fast model (deepseek-v4-flash) for schema generation, summaries, reranking, and codegen
 - **Fireworks AI** as the LLM backend for JSON extraction (or any OpenAI-compatible API)
@@ -52,7 +52,7 @@ firecrawl-selfhost/
 
 ## What's Included
 
-### 13 Working Features (all unlimited)
+### 14 Working Features (all unlimited)
 
 | # | Feature | Backend | Limits Removed |
 |---|---------|---------|----------------|
@@ -69,16 +69,20 @@ firecrawl-selfhost/
 | 11 | `research_read_paper` | arXiv PDF download | All PDF pages, 500 passages |
 | 12 | `research_related_papers` | OpenAlex citations | 10,000 results, 20 seed IDs |
 | 13 | `research_search_github` | GitHub API | 1,000 results |
+| 14 | `developer_search` | GitHub code, issues, and repositories | 100 results |
 
-### 6 Features NOT Available (require cloud infrastructure)
+### Features Requiring Additional Infrastructure
 
 | Feature | Reason |
 |---------|--------|
 | `interact` | Requires Supabase database for stored scrape context |
 | `monitor_*` | Requires database for monitor persistence |
 | `feedback` / `search_feedback` | Requires database |
+| Screenshot/actions | Require a Fire Engine endpoint via `FIRE_ENGINE_BETA_URL` |
 
-**Agent** (`agent` / `agent_status`) now works locally — it scrapes provided URLs (or searches the web if no URLs), then uses the LLM to synthesize a research report. Uses in-memory storage instead of Supabase.
+The local agent patch scrapes supplied URLs (or searches when no URLs are
+provided) and synthesizes the result with the configured LLM using in-memory
+job state.
 
 ## Step-by-Step Installation
 
