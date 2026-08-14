@@ -5,7 +5,8 @@ Complete self-hosting package for [Firecrawl](https://github.com/firecrawl/firec
 - **No rate limits** on any of the 14 working features
 - **Custom research service** (6 endpoints: search_papers, inspect_paper, read_paper, related_papers, search_github, developer_search)
 - **SearXNG** meta-search backend (Google + Bing + DuckDuckGo + Wikipedia)
-- **Dual LLM model strategy** — heavy model (gpt-oss-120b) for extraction, fast model (deepseek-v4-flash) for schema generation, summaries, reranking, and codegen
+- **Dual LLM model strategy** — heavy model for extraction, fast model for schema generation, summaries, reranking, and codegen
+- **DeepSeek-V4-Flash-0731** as default LLM (284B MoE, $0.14/1M tokens, 1M context, fast+cheap)
 - **Fireworks AI** as the LLM backend for JSON extraction (or any OpenAI-compatible API)
 - **Maxed-out Docker resources** (32 workers, 50 concurrent crawls, 20 browser instances)
 
@@ -126,11 +127,12 @@ nano .env
 - OpenAI: `OPENAI_BASE_URL=https://api.openai.com/v1`, `MODEL_NAME=gpt-4o-mini`
 
 **Dual-model setup (recommended for Fireworks AI):**
-- `MODEL_NAME` = heavy model for accurate structured data extraction (gpt-oss-120b)
-- `MODEL_NAME_FAST` = fast/cheap model for schema generation, summaries, reranking, codegen (deepseek-v4-flash)
-- DeepSeek-V4-Flash: 284B MoE, $0.14/1M tokens, low latency, 1M context, strong reasoning+coding — ideal for high-volume fast tasks
+- `MODEL_NAME` = heavy model for accurate structured data extraction (e.g. `gpt-oss-120b`)
+- `MODEL_NAME_FAST` = fast/cheap model for schema generation, summaries, reranking, codegen (e.g. `deepseek-v4-flash-0731`)
+- DeepSeek-V4-Flash-0731: 284B MoE, $0.14/1M tokens, low latency, 1M context, strong reasoning+coding
 - GPT-OSS-120B: 120B, good structured output — ideal for accurate data extraction
 - If `MODEL_NAME_FAST` is not set, all tasks use `MODEL_NAME` (single-model mode)
+- **Simplest setup**: set both to `deepseek-v4-flash-0731` — it handles both extraction and fast tasks well
 
 ### Step 4: Build and start
 
