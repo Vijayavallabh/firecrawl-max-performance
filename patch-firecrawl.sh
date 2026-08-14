@@ -281,9 +281,55 @@ sed -i 's/timeout: z.int().positive().finite().prefault(60000)/timeout: z.int().
 echo "  Done."
 
 # ── 4. Research proxy: increase timeout ───────────────────────────────
-echo "[4/10] Patching research-proxy.ts (timeout 120s -> 600s)..."
+echo "[4/11] Patching research-upstream.ts (timeout 120s -> 600s)..."
 sed -i 's/const TIMEOUT_MS = 120_000/const TIMEOUT_MS = 600_000/' \
-  "$FIRECRAWL_DIR/apps/api/src/controllers/v2/research-proxy.ts"
+  "$FIRECRAWL_DIR/apps/api/src/lib/research-upstream.ts"
+echo "  Done."
+
+# ── 4b. Map: add direct HTML link extraction fallback ────────────────
+echo "[4b/11] Patching map-utils.ts (add direct HTML scraping fallback)..."
+MAP_UTILS="$FIRECRAWL_DIR/apps/api/src/lib/map-utils.ts"
+# Add config import if not present
+if ! grep -q 'import { config } from "../config"' "$MAP_UTILS"; then
+  sed -i 's|import { Logger } from "winston";|import { Logger } from "winston";\nimport { config } from "../config";|' "$MAP_UTILS"
+fi
+# Add the direct scraping fallback after the cosine similarity block
+if ! grep -q "map-fallback" "$MAP_UTILS"; then
+  sed -i '/if (search) {$/,/^  }$/{
+    /^  }$/a\
+\
+    // Direct HTML scraping fallback: when search-based approaches return\
+    // empty or very few results, scrape the page directly and extract links.\
+    // This handles JS-rendered sites (GitHub, SPAs) and sites without sitemaps.\
+    if (mapResults.length <= 1 \&\& crawlerOptions.sitemap !== "only") {\
+      try {\
+        const directUrl = resolvedUrl || url;\
+        const controller = new AbortController();\
+        const timeout = setTimeout(() => controller.abort(), 30000);\
+        const resp = await fetch(directUrl, {\
+          signal: controller.signal,\
+          headers: {\
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",\
+            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",\
+            ...headers,\
+          },\
+          redirect: "follow",\
+        });\
+        clearTimeout(timeout);\
+        if (resp.ok) {\
+          const html = await resp.text();\
+          const contentType = resp.headers.get("content-type") || "";\
+          const extractedLinks = await crawler.extractLinksFromContent(html, directUrl, contentType);\
+          for (const link of extractedLinks) {\
+            mapResults.push({ url: link });\
+          }\
+        }\
+      } catch (e) {\
+        // Direct scraping failed, continue with whatever we have\
+      }\
+    }
+  }' "$MAP_UTILS"
+fi
 echo "  Done."
 
 # ── 5. Copy research-service into Firecrawl apps dir ─────────────────

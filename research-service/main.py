@@ -7,7 +7,6 @@ import os
 import asyncio
 import xml.etree.ElementTree as ET
 from typing import Optional, List
-from urllib.parse import quote
 
 app = FastAPI(title="Firecrawl Research Proxy")
 
@@ -15,11 +14,16 @@ OPENALEX_BASE = "https://api.openalex.org"
 ARXIV_BASE = "https://export.arxiv.org/api"
 GITHUB_BASE = "https://api.github.com"
 S2_BASE = "https://api.semanticscholar.org/graph/v1"
+S2_RECOMMENDATIONS_BASE = "https://api.semanticscholar.org/recommendations/v1"
+CROSSREF_BASE = "https://api.crossref.org"
+EUROPEPMC_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 MAILTO = os.environ.get("MAILTO", "research@firecrawl.local")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 S2_API_KEY = os.environ.get("S2_API_KEY", "")
 
 TIMEOUT = 300.0
+
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 def oa_params(extra=None):
     p = {"mailto": MAILTO}
@@ -238,6 +242,169 @@ async def arxiv_to_openalex_id(arxiv_id: str) -> Optional[str]:
     return None
 
 
+async def crossref_lookup(doi: str) -> Optional[dict]:
+    """Fallback: look up a DOI via Crossref when OpenAlex 404s."""
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(f"{CROSSREF_BASE}/works/{doi}")
+        if resp.status_code != 200:
+            return None
+        msg = resp.json().get("message", {})
+        title_parts = msg.get("title") or []
+        title = title_parts[0] if title_parts else None
+        authors = []
+        for a in msg.get("author") or []:
+            name = f"{a.get('given', '')} {a.get('family', '')}".strip()
+            if name:
+                authors.append({"name": name})
+        abstract = msg.get("abstract")
+        if abstract:
+            abstract = re.sub(r"<[^>]+>", "", abstract)
+        pub_date = None
+        for dp in ("published-print", "published-online", "created"):
+            parts = msg.get(dp, {}).get("date-parts")
+            if parts and parts[0]:
+                pub_date = "-".join(str(p) for p in parts[0])
+                break
+        return {
+            "paperId": doi,
+            "primaryId": f"doi:{doi}",
+            "title": title,
+            "authors": authors,
+            "abstract": abstract,
+            "categories": [c for c in msg.get("subject") or []],
+            "createdDate": pub_date,
+            "updateDate": pub_date,
+            "ids": {"DOI": [doi]},
+            "openAlexId": None,
+        }
+    except Exception as e:
+        print(f"Crossref lookup error: {e}")
+        return None
+
+
+async def s2_lookup(paper_id: str) -> Optional[dict]:
+    """Fallback: look up a paper via Semantic Scholar Graph API."""
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(
+                f"{S2_BASE}/paper/{paper_id}",
+                params={"fields": "paperId,title,abstract,authors,year,venue,externalIds,openAccessPdf,citationCount,referenceCount"},
+                headers=s2_headers(),
+            )
+        if resp.status_code != 200:
+            return None
+        p = resp.json()
+        ext = p.get("externalIds") or {}
+        ids = {}
+        if ext.get("DOI"):
+            ids["DOI"] = [ext["DOI"]]
+        if ext.get("ArXiv"):
+            ids["ArXiv"] = [ext["ArXiv"]]
+        if ext.get("PubMed"):
+            ids["PMID"] = [str(ext["PubMed"])]
+        if ext.get("PubMedCentral"):
+            ids["PMCID"] = [ext["PubMedCentral"]]
+        ids["CorpusId"] = [str(p.get("paperId", ""))]
+        authors = [{"name": a.get("name", "")} for a in p.get("authors") or []]
+        primary = None
+        for ns in ("ArXiv", "DOI", "PMCID", "PMID"):
+            if ids.get(ns):
+                primary = f"{ns.lower()}:{ids[ns][0]}"
+                break
+        if not primary:
+            primary = f"corpusid:{p.get('paperId', '')}"
+        return {
+            "paperId": str(p.get("paperId", "")),
+            "primaryId": primary,
+            "title": p.get("title"),
+            "authors": authors,
+            "abstract": p.get("abstract"),
+            "categories": [p.get("venue")] if p.get("venue") else [],
+            "createdDate": str(p.get("year", "")),
+            "updateDate": str(p.get("year", "")),
+            "ids": ids,
+            "openAlexId": None,
+        }
+    except Exception as e:
+        print(f"S2 lookup error: {e}")
+        return None
+
+
+async def s2_recommendations(paper_id: str, limit: int = 20) -> list:
+    """Get similar papers from Semantic Scholar recommendations API."""
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(
+                f"{S2_RECOMMENDATIONS_BASE}/papers/forpaper/{paper_id}",
+                params={"fields": "paperId,title,abstract,authors,year,venue,externalIds,citationCount", "limit": limit},
+                headers=s2_headers(),
+            )
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        results = []
+        for p in data.get("recommendedPapers") or []:
+            ext = p.get("externalIds") or {}
+            ids = {}
+            if ext.get("DOI"):
+                ids["DOI"] = [ext["DOI"]]
+            if ext.get("ArXiv"):
+                ids["ArXiv"] = [ext["ArXiv"]]
+            if ext.get("PubMed"):
+                ids["PMID"] = [str(ext["PubMed"])]
+            authors = [{"name": a.get("name", "")} for a in p.get("authors") or []]
+            primary = None
+            for ns in ("ArXiv", "DOI", "PMID"):
+                if ids.get(ns):
+                    primary = f"{ns.lower()}:{ids[ns][0]}"
+                    break
+            if not primary:
+                primary = f"corpusid:{p.get('paperId', '')}"
+            results.append({
+                "paperId": str(p.get("paperId", "")),
+                "primaryId": primary,
+                "title": p.get("title"),
+                "authors": authors,
+                "abstract": p.get("abstract"),
+                "categories": [p.get("venue")] if p.get("venue") else [],
+                "createdDate": str(p.get("year", "")),
+                "updateDate": str(p.get("year", "")),
+                "ids": ids,
+                "openAlexId": None,
+            })
+        return results
+    except Exception as e:
+        print(f"S2 recommendations error: {e}")
+        return []
+
+
+async def resolve_oa_id(paper_id: str) -> Optional[str]:
+    """Resolve any paper ID format to an OpenAlex work ID."""
+    lower = paper_id.lower()
+    if lower.startswith("arxiv:"):
+        return await arxiv_to_openalex_id(paper_id[len("arxiv:"):])
+    oa_id_raw = normalize_paper_id(paper_id)
+    if oa_id_raw.startswith("doi:"):
+        oa_lookup = f"doi:{oa_id_raw[4:]}"
+    elif oa_id_raw.startswith("pmid:"):
+        oa_lookup = f"pmid:{oa_id_raw[5:]}"
+    elif oa_id_raw.startswith("pmcid:"):
+        oa_lookup = f"pmcid:{oa_id_raw[6:]}"
+    elif oa_id_raw.startswith("W"):
+        oa_lookup = oa_id_raw
+    else:
+        oa_lookup = oa_id_raw
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(f"{OPENALEX_BASE}/works/{oa_lookup}", params=oa_params({"select": "id"}))
+        if resp.status_code == 200:
+            return resp.json().get("id", "").rsplit("/", 1)[-1]
+    except Exception:
+        pass
+    return None
+
+
 @app.get("/v2/research/papers")
 async def search_papers(
     request: Request,
@@ -305,7 +472,213 @@ async def search_papers(
     return {"success": True, "results": results, "total": len(all_results)}
 
 
-@app.get("/v2/research/papers/{paper_id}")
+# ── Route order matters: register /similar BEFORE /{paper_id} ──
+# because {paper_id:path} is greedy and would swallow "X/similar" as paper_id.
+
+@app.get("/v2/research/papers/{paper_id:path}/similar")
+async def similar_papers(
+    paper_id: str,
+    request: Request,
+    intent: str = Query(..., min_length=1),
+    mode: Optional[str] = Query(None),
+    k: Optional[int] = Query(None, ge=1, le=10000),
+    rerank: Optional[str] = Query(None),
+    origin: Optional[str] = Query(None),
+    integration: Optional[str] = Query(None),
+):
+    oa_id = await resolve_oa_id(paper_id)
+    if not oa_id:
+        return JSONResponse(status_code=404, content={"success": False, "error": "Paper not found"})
+
+    limit = min(k or 20, 200)
+    anchors = request.query_params.getlist("anchor")
+
+    params = oa_params({
+        "select": "id,doi,title,abstract_inverted_index,authorships,concepts,publication_date,ids,locations,referenced_works,cited_by_count",
+    })
+
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        resp = await client.get(f"{OPENALEX_BASE}/works/{oa_id}", params=params)
+
+    if resp.status_code != 200:
+        return JSONResponse(status_code=404, content={"success": False, "error": "Paper not found"})
+
+    work = resp.json()
+    seed_refs = set(r.rsplit("/", 1)[-1] for r in (work.get("referenced_works") or []))
+
+    results = []
+    pool_size = 0
+
+    # Try Semantic Scholar recommendations first (best quality)
+    s2_id = paper_id
+    if not paper_id.startswith("CorpusId:"):
+        # Try to find S2-compatible ID
+        raw_ids = work.get("ids") or {}
+        if raw_ids.get("doi"):
+            s2_id = raw_ids["doi"].replace("https://doi.org/", "DOI:")
+        elif raw_ids.get("pmid"):
+            s2_id = f"PMID:{raw_ids['pmid']}"
+        elif raw_ids.get("pmcid"):
+            s2_id = raw_ids["pmcid"]
+        else:
+            s2_id = f"CorpusId:{oa_id}"
+
+    s2_results = await s2_recommendations(s2_id, limit)
+    if s2_results:
+        pool_size += len(s2_results)
+        results.extend(s2_results)
+
+    # If S2 didn't return enough, fall back to OpenAlex co-citation
+    if len(results) < limit:
+        remaining = limit - len(results)
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            if mode == "references":
+                ref_ids = work.get("referenced_works") or []
+                pool_size = len(ref_ids)
+                batch = ref_ids[:remaining]
+                if batch:
+                    ids_param = "|".join(r.rsplit("/", 1)[-1] for r in batch)
+                    resp2 = await client.get(
+                        f"{OPENALEX_BASE}/works",
+                        params=oa_params({
+                            "filter": f"openalex_id:{ids_param}",
+                            "per_page": min(len(batch), 200),
+                            "select": "id,doi,title,abstract_inverted_index,authorships,concepts,publication_date,ids,locations",
+                        }),
+                    )
+                    if resp2.status_code == 200:
+                        for w in resp2.json().get("results", []):
+                            results.append(oa_to_result(w))
+
+            elif mode == "citers":
+                resp2 = await client.get(
+                    f"{OPENALEX_BASE}/works",
+                    params=oa_params({
+                        "filter": f"cites:{oa_id}",
+                        "per_page": remaining,
+                        "select": "id,doi,title,abstract_inverted_index,authorships,concepts,publication_date,ids,locations",
+                        "sort": "cited_by_count:desc",
+                    }),
+                )
+                if resp2.status_code == 200:
+                    data2 = resp2.json()
+                    for w in data2.get("results", []):
+                        results.append(oa_to_result(w))
+                    pool_size += data2.get("meta", {}).get("count", 0)
+
+            else:
+                # Default "similar" mode: co-citation scored candidates
+                # Get citers (papers that cite this one)
+                resp2 = await client.get(
+                    f"{OPENALEX_BASE}/works",
+                    params=oa_params({
+                        "filter": f"cites:{oa_id}",
+                        "per_page": remaining,
+                        "select": "id,doi,title,abstract_inverted_index,authorships,concepts,publication_date,ids,locations,referenced_works",
+                        "sort": "cited_by_count:desc",
+                    }),
+                )
+                candidates = []
+                if resp2.status_code == 200:
+                    for w in resp2.json().get("results", []):
+                        candidates.append(w)
+                        results.append(oa_to_result(w))
+                    pool_size += resp2.json().get("meta", {}).get("count", 0)
+
+                # Score candidates by co-citation: how many of the seed's refs do they share?
+                if candidates and seed_refs:
+                    scored = []
+                    for w in candidates:
+                        c_refs = set(r.rsplit("/", 1)[-1] for r in (w.get("referenced_works") or []))
+                        shared = len(seed_refs & c_refs)
+                        scored.append((shared, w))
+                    scored.sort(key=lambda x: x[0], reverse=True)
+                    # Rebuild results in co-citation order
+                    existing_ids = {r.get("paperId") for r in results}
+                    results = [oa_to_result(w) for _, w in scored]
+                    # Add back any S2 results that weren't in the co-citation set
+                    for s2r in s2_results:
+                        if s2r.get("paperId") not in {r.get("paperId") for r in results}:
+                            results.insert(0, s2r)
+
+                # Also add seed's own references as candidates (bibliographic coupling)
+                if len(results) < limit and seed_refs:
+                    batch = list(seed_refs)[:remaining]
+                    ids_param = "|".join(batch)
+                    resp3 = await client.get(
+                        f"{OPENALEX_BASE}/works",
+                        params=oa_params({
+                            "filter": f"openalex_id:{ids_param}",
+                            "per_page": min(len(batch), 200),
+                            "select": "id,doi,title,abstract_inverted_index,authorships,concepts,publication_date,ids,locations",
+                        }),
+                    )
+                    if resp3.status_code == 200:
+                        for w in resp3.json().get("results", []):
+                            results.append(oa_to_result(w))
+
+        # Handle anchors
+        if anchors:
+            for anchor in anchors:
+                a_oa_id = await resolve_oa_id(anchor)
+                if not a_oa_id:
+                    continue
+                async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                    a_resp = await client.get(f"{OPENALEX_BASE}/works/{a_oa_id}", params=params)
+                if a_resp.status_code != 200:
+                    continue
+                a_work = a_resp.json()
+                a_refs = a_work.get("referenced_works") or []
+                pool_size += len(a_refs)
+                if mode == "references":
+                    batch = a_refs[:limit]
+                else:
+                    batch = a_refs[:limit]
+                if batch:
+                    ids_param = "|".join(r.rsplit("/", 1)[-1] for r in batch)
+                    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                        r2 = await client.get(
+                            f"{OPENALEX_BASE}/works",
+                            params=oa_params({
+                                "filter": f"openalex_id:{ids_param}",
+                                "per_page": min(len(batch), 200),
+                                "select": "id,doi,title,abstract_inverted_index,authorships,concepts,publication_date,ids,locations",
+                            }),
+                        )
+                    if r2.status_code == 200:
+                        for w in r2.json().get("results", []):
+                            results.append(oa_to_result(w))
+
+    # Deduplicate
+    seen = set()
+    deduped = []
+    for r in results:
+        pid = r.get("paperId")
+        if pid and pid not in seen:
+            seen.add(pid)
+            deduped.append(r)
+    results = deduped
+
+    # If intent provided, do a simple relevance rerank
+    if intent and not s2_results:
+        intent_words = set(re.findall(r"\w+", intent.lower()))
+        if intent_words:
+            scored = []
+            for r in results:
+                text = " ".join(filter(None, [r.get("title") or "", r.get("abstract") or ""])).lower()
+                text_words = set(re.findall(r"\w+", text))
+                overlap = len(intent_words & text_words)
+                scored.append((overlap, r))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            results = [r for _, r in scored]
+
+    if k:
+        results = results[:k]
+
+    return {"success": True, "results": results, "poolSize": pool_size}
+
+
+@app.get("/v2/research/papers/{paper_id:path}")
 async def get_paper(
     paper_id: str,
     request: Request,
@@ -331,6 +704,7 @@ async def get_paper(
 
             return {"success": True, "paper": arxiv_result}
 
+    # Try OpenAlex first
     oa_id_raw = normalize_paper_id(paper_id)
     if oa_id_raw.startswith("doi:"):
         oa_lookup = f"doi:{oa_id_raw[4:]}"
@@ -351,6 +725,21 @@ async def get_paper(
         resp = await client.get(f"{OPENALEX_BASE}/works/{oa_lookup}", params=params)
 
     if resp.status_code == 404:
+        # Fallback: try Crossref for DOI lookups
+        if oa_id_raw.startswith("doi:"):
+            crossref_result = await crossref_lookup(oa_id_raw[4:])
+            if crossref_result:
+                if query is not None:
+                    passages = await find_passages(crossref_result, {}, query, k or 4)
+                    return {"success": True, "passages": passages}
+                return {"success": True, "paper": crossref_result}
+        # Fallback: try Semantic Scholar
+        s2_result = await s2_lookup(paper_id)
+        if s2_result:
+            if query is not None:
+                passages = await find_passages(s2_result, {}, query, k or 4)
+                return {"success": True, "passages": passages}
+            return {"success": True, "paper": s2_result}
         return JSONResponse(status_code=404, content={"success": False, "error": "Paper not found"})
     if resp.status_code != 200:
         return JSONResponse(status_code=resp.status_code, content={"success": False, "error": f"OpenAlex error: {resp.text}"})
@@ -363,212 +752,6 @@ async def get_paper(
         return {"success": True, "passages": passages}
 
     return {"success": True, "paper": result}
-
-
-@app.get("/v2/research/papers/{paper_id}/similar")
-async def similar_papers(
-    paper_id: str,
-    request: Request,
-    intent: str = Query(..., min_length=1),
-    mode: Optional[str] = Query(None),
-    k: Optional[int] = Query(None, ge=1, le=10000),
-    rerank: Optional[str] = Query(None),
-    origin: Optional[str] = Query(None),
-    integration: Optional[str] = Query(None),
-):
-    lower_pid = paper_id.lower()
-    is_arxiv = lower_pid.startswith("arxiv:")
-    arxiv_id = paper_id[len("arxiv:"):] if is_arxiv else None
-
-    oa_id = None
-    if is_arxiv:
-        oa_id = await arxiv_to_openalex_id(arxiv_id)
-    if not oa_id:
-        oa_id_raw = normalize_paper_id(paper_id)
-        if oa_id_raw.startswith("doi:"):
-            oa_lookup = f"doi:{oa_id_raw[4:]}"
-        elif oa_id_raw.startswith("pmid:"):
-            oa_lookup = f"pmid:{oa_id_raw[5:]}"
-        elif oa_id_raw.startswith("pmcid:"):
-            oa_lookup = f"pmcid:{oa_id_raw[6:]}"
-        elif oa_id_raw.startswith("W"):
-            oa_lookup = oa_id_raw
-        else:
-            oa_lookup = oa_id_raw
-
-        params_lookup = oa_params({"select": "id"})
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            resp_lookup = await client.get(f"{OPENALEX_BASE}/works/{oa_lookup}", params=params_lookup)
-        if resp_lookup.status_code == 200:
-            oa_id = resp_lookup.json().get("id", "").rsplit("/", 1)[-1]
-    else:
-        oa_lookup = oa_id
-
-    if not oa_id:
-        return JSONResponse(status_code=404, content={"success": False, "error": "Paper not found"})
-
-    limit = min(k or 20, 200)
-    anchors = request.query_params.getlist("anchor")
-
-    params = oa_params({
-        "select": "id,doi,title,abstract_inverted_index,authorships,concepts,publication_date,ids,locations,referenced_works,cited_by_count",
-    })
-
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        resp = await client.get(f"{OPENALEX_BASE}/works/{oa_id}", params=params)
-
-    if resp.status_code != 200:
-        return JSONResponse(status_code=404, content={"success": False, "error": "Paper not found"})
-
-    work = resp.json()
-
-    results = []
-    pool_size = 0
-
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        if mode == "references":
-            ref_ids = work.get("referenced_works") or []
-            pool_size = len(ref_ids)
-            batch = ref_ids[:limit]
-            if batch:
-                ids_param = "|".join(r.rsplit("/", 1)[-1] for r in batch)
-                resp2 = await client.get(
-                    f"{OPENALEX_BASE}/works",
-                    params=oa_params({
-                        "filter": f"openalex_id:{ids_param}",
-                        "per_page": min(len(batch), 200),
-                        "select": "id,doi,title,abstract_inverted_index,authorships,concepts,publication_date,ids,locations",
-                    }),
-                )
-                if resp2.status_code == 200:
-                    for w in resp2.json().get("results", []):
-                        results.append(oa_to_result(w))
-
-        elif mode == "citers":
-            resp2 = await client.get(
-                f"{OPENALEX_BASE}/works",
-                params=oa_params({
-                    "filter": f"cites:{oa_id}",
-                    "per_page": limit,
-                    "select": "id,doi,title,abstract_inverted_index,authorships,concepts,publication_date,ids,locations",
-                    "sort": "cited_by_count:desc",
-                }),
-            )
-            if resp2.status_code == 200:
-                data2 = resp2.json()
-                for w in data2.get("results", []):
-                    results.append(oa_to_result(w))
-                pool_size = data2.get("meta", {}).get("count", len(results))
-
-        else:
-            related = work.get("referenced_works") or []
-            pool_size = len(related)
-
-            resp2 = await client.get(
-                f"{OPENALEX_BASE}/works",
-                params=oa_params({
-                    "filter": f"cites:{oa_id}",
-                    "per_page": limit,
-                    "select": "id,doi,title,abstract_inverted_index,authorships,concepts,publication_date,ids,locations",
-                    "sort": "cited_by_count:desc",
-                }),
-            )
-            if resp2.status_code == 200:
-                for w in resp2.json().get("results", []):
-                    results.append(oa_to_result(w))
-
-            if len(results) < limit and related:
-                batch = related[:limit - len(results)]
-                ids_param = "|".join(r.rsplit("/", 1)[-1] for r in batch)
-                resp3 = await client.get(
-                    f"{OPENALEX_BASE}/works",
-                    params=oa_params({
-                        "filter": f"openalex_id:{ids_param}",
-                        "per_page": min(len(batch), 200),
-                        "select": "id,doi,title,abstract_inverted_index,authorships,concepts,publication_date,ids,locations",
-                    }),
-                )
-                if resp3.status_code == 200:
-                    for w in resp3.json().get("results", []):
-                        results.append(oa_to_result(w))
-
-        if anchors:
-            for anchor in anchors:
-                a_raw = normalize_paper_id(anchor)
-                if a_raw.startswith("doi:"):
-                    a_lookup = f"doi:{a_raw[4:]}"
-                elif a_raw.startswith("W"):
-                    a_lookup = a_raw
-                else:
-                    a_lookup = a_raw
-                a_resp = await client.get(f"{OPENALEX_BASE}/works/{a_lookup}", params=params)
-                if a_resp.status_code != 200:
-                    continue
-                a_work = a_resp.json()
-                a_oa_id = a_work.get("id", "").rsplit("/", 1)[-1]
-                if mode == "references":
-                    a_refs = a_work.get("referenced_works") or []
-                    pool_size += len(a_refs)
-                    batch = a_refs[:limit]
-                    if batch:
-                        ids_param = "|".join(r.rsplit("/", 1)[-1] for r in batch)
-                        r2 = await client.get(
-                            f"{OPENALEX_BASE}/works",
-                            params=oa_params({
-                                "filter": f"openalex_id:{ids_param}",
-                                "per_page": min(len(batch), 200),
-                                "select": "id,doi,title,abstract_inverted_index,authorships,concepts,publication_date,ids,locations",
-                            }),
-                        )
-                        if r2.status_code == 200:
-                            for w in r2.json().get("results", []):
-                                results.append(oa_to_result(w))
-                elif mode == "citers":
-                    r2 = await client.get(
-                        f"{OPENALEX_BASE}/works",
-                        params=oa_params({
-                            "filter": f"cites:{a_oa_id}",
-                            "per_page": limit,
-                            "select": "id,doi,title,abstract_inverted_index,authorships,concepts,publication_date,ids,locations",
-                            "sort": "cited_by_count:desc",
-                        }),
-                    )
-                    if r2.status_code == 200:
-                        d2 = r2.json()
-                        for w in d2.get("results", []):
-                            results.append(oa_to_result(w))
-                        pool_size += d2.get("meta", {}).get("count", 0)
-                else:
-                    a_refs = a_work.get("referenced_works") or []
-                    pool_size += len(a_refs)
-                    batch = a_refs[:limit]
-                    if batch:
-                        ids_param = "|".join(r.rsplit("/", 1)[-1] for r in batch)
-                        r2 = await client.get(
-                            f"{OPENALEX_BASE}/works",
-                            params=oa_params({
-                                "filter": f"openalex_id:{ids_param}",
-                                "per_page": min(len(batch), 200),
-                                "select": "id,doi,title,abstract_inverted_index,authorships,concepts,publication_date,ids,locations",
-                            }),
-                        )
-                        if r2.status_code == 200:
-                            for w in r2.json().get("results", []):
-                                results.append(oa_to_result(w))
-
-    seen = set()
-    deduped = []
-    for r in results:
-        pid = r.get("paperId")
-        if pid and pid not in seen:
-            seen.add(pid)
-            deduped.append(r)
-    results = deduped
-
-    if k:
-        results = results[:k]
-
-    return {"success": True, "results": results, "poolSize": pool_size}
 
 
 @app.get("/v2/research/github")
@@ -643,191 +826,6 @@ async def search_github(
     return {"success": True, "results": results}
 
 
-def developer_github_query(
-    query: str,
-    repos: Optional[List[str]],
-    language: Optional[str],
-    topics: Optional[List[str]],
-    license_name: Optional[str],
-    min_stars: Optional[int],
-    max_stars: Optional[int],
-    archived: Optional[bool],
-    fork: Optional[bool],
-    skills: Optional[str],
-) -> str:
-    parts = [query.strip()]
-    for repo in repos or []:
-        if repo.strip():
-            parts.append(f"repo:{repo.strip()}")
-    if language:
-        parts.append(f"language:{language}")
-    for topic in topics or []:
-        if topic.strip():
-            parts.append(f"topic:{topic.strip()}")
-    if license_name:
-        parts.append(f"license:{license_name}")
-    if min_stars is not None:
-        parts.append(f"stars:>={min_stars}")
-    if max_stars is not None:
-        parts.append(f"stars:<={max_stars}")
-    if archived is not None:
-        parts.append(f"archived:{str(archived).lower()}")
-    if fork is not None:
-        parts.append(f"fork:{str(fork).lower()}")
-    if skills == "only":
-        parts.append("path:skills")
-    return " ".join(parts)
-
-
-async def github_json(client: httpx.AsyncClient, path: str, params: dict) -> dict:
-    try:
-        response = await client.get(
-            f"{GITHUB_BASE}{path}",
-            params=params,
-            headers=gh_headers(),
-        )
-        if response.status_code == 200:
-            return response.json()
-    except Exception:
-        pass
-    return {}
-
-
-async def code_passage(client: httpx.AsyncClient, item: dict) -> str:
-    repository = (item.get("repository") or {}).get("full_name", "")
-    path = item.get("path", "")
-    if repository and path:
-        try:
-            response = await client.get(
-                f"{GITHUB_BASE}/repos/{repository}/contents/{quote(path, safe='/')}",
-                headers={**gh_headers(), "Accept": "application/vnd.github.raw"},
-            )
-            if response.status_code == 200 and response.text.strip():
-                return response.text[:2400]
-        except Exception:
-            pass
-    return f"{repository}/{path}".strip("/")
-
-
-@app.get("/v2/code/search")
-async def search_developer(
-    query: str = Query(..., min_length=1),
-    k: Optional[int] = Query(None, ge=1, le=100),
-    types: Optional[List[str]] = Query(None),
-    repos: Optional[List[str]] = Query(None),
-    sources: Optional[List[str]] = Query(None),
-    passages: Optional[int] = Query(None, ge=1, le=5),
-    language: Optional[str] = Query(None, min_length=1),
-    topic: Optional[List[str]] = Query(None),
-    license: Optional[str] = Query(None, min_length=1),
-    min_stars: Optional[int] = Query(None, ge=0),
-    max_stars: Optional[int] = Query(None, ge=0),
-    archived: Optional[bool] = Query(None),
-    fork: Optional[bool] = Query(None),
-    skills: Optional[str] = Query(None),
-):
-    """Provide a local developer-search surface using the GitHub API."""
-    limit = min(k or 10, 100)
-    requested_types = {value.lower() for value in (types or [])}
-    source_values = {value.lower() for value in (sources or [])}
-    github_requested = not source_values or "github" in source_values
-    include_code = not requested_types or "code" in requested_types
-    include_issues = not requested_types or bool(
-        requested_types & {"issue", "issues", "pull_request", "pr"}
-    )
-    include_repositories = not requested_types or bool(
-        requested_types & {"repository", "repo", "readme", "docs"}
-    )
-    if not github_requested:
-        return {"success": True, "results": []}
-
-    github_query = developer_github_query(
-        query,
-        repos,
-        language,
-        topic,
-        license,
-        min_stars,
-        max_stars,
-        archived,
-        fork,
-        skills,
-    )
-    search_limit = min(max(limit, 10), 100)
-    search_tasks = []
-    search_kinds = []
-    if include_code:
-        search_tasks.append(
-            ("code", "/search/code", {"q": github_query, "per_page": search_limit})
-        )
-        search_kinds.append("code")
-    if include_issues:
-        search_tasks.append(
-            ("issues", "/search/issues", {"q": github_query, "per_page": search_limit})
-        )
-        search_kinds.append("issues")
-    if include_repositories:
-        search_tasks.append(
-            (
-                "repositories",
-                "/search/repositories",
-                {"q": github_query, "per_page": search_limit},
-            )
-        )
-        search_kinds.append("repositories")
-
-    results = []
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        payloads = await asyncio.gather(
-            *(github_json(client, path, params) for _, path, params in search_tasks)
-        )
-        for kind, payload in zip(search_kinds, payloads):
-            items = payload.get("items", []) if isinstance(payload, dict) else []
-            if kind == "code":
-                passages_text = await asyncio.gather(
-                    *(code_passage(client, item) for item in items[:limit])
-                )
-                for item, passage in zip(items[:limit], passages_text):
-                    repository = (item.get("repository") or {}).get("full_name", "")
-                    path = item.get("path", "")
-                    results.append(
-                        {
-                            "id": f"github:code:{repository}:{path}",
-                            "type": "code",
-                            "title": f"{repository}/{path}".strip("/"),
-                            "url": item.get("html_url", ""),
-                            "passages": [{"text": passage}],
-                        }
-                    )
-            elif kind == "issues":
-                for item in items[:limit]:
-                    is_pr = "pull_request" in item
-                    body = (item.get("body") or item.get("title") or "").strip()
-                    results.append(
-                        {
-                            "id": f"github:{'pr' if is_pr else 'issue'}:{item.get('id', '')}",
-                            "type": "pull_request" if is_pr else "issue",
-                            "title": item.get("title", ""),
-                            "url": item.get("html_url", ""),
-                            "passages": [{"text": body[:2400]}],
-                        }
-                    )
-            else:
-                for item in items[:limit]:
-                    description = (item.get("description") or "").strip()
-                    results.append(
-                        {
-                            "id": f"github:repo:{item.get('id', '')}",
-                            "type": "repository",
-                            "title": item.get("full_name", ""),
-                            "url": item.get("html_url", ""),
-                            "passages": [{"text": description or item.get("name", "")}],
-                        }
-                    )
-
-    return {"success": True, "results": results[:limit]}
-
-
 async def find_passages(result: dict, work: dict, question: str, num_passages: int) -> list:
     arxiv_id = get_arxiv_id_from_ids(result.get("ids", {}))
     pdf_url = None
@@ -840,6 +838,31 @@ async def find_passages(result: dict, work: dict, question: str, num_passages: i
     if not pdf_url and arxiv_id:
         pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
 
+    # Try Europe PMC full-text XML if PMCID is available
+    pmcid = None
+    ids = result.get("ids", {})
+    raw_ids = work.get("ids", {}) if work else {}
+    if raw_ids.get("pmcid"):
+        pmcid = raw_ids["pmcid"]
+    elif ids.get("PMCID"):
+        pmcid = ids["PMCID"][0]
+
+    if pmcid and not pdf_url:
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+                resp = await client.get(f"{EUROPEPMC_BASE}/{pmcid}/fullTextXML")
+            if resp.status_code == 200 and resp.text:
+                text = re.sub(r"<[^>]+>", " ", resp.text)
+                text = re.sub(r"\s+", " ", text)
+                if text.strip():
+                    passages = split_into_passages(text)
+                    ranked = rank_passages(passages, question)
+                    top = ranked[:num_passages]
+                    return [{"text": p} for p in top]
+        except Exception as e:
+            print(f"Europe PMC full-text error: {e}")
+
+    # Try OpenAlex best_oa_location or locations PDFs
     if not pdf_url:
         locations = work.get("locations") or []
         for loc in locations:
@@ -848,12 +871,30 @@ async def find_passages(result: dict, work: dict, question: str, num_passages: i
                 pdf_url = pdf
                 break
 
+    # Try Semantic Scholar openAccessPdf
+    if not pdf_url:
+        paper_id_for_s2 = result.get("primaryId", "")
+        if paper_id_for_s2:
+            try:
+                async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                    s2_resp = await client.get(
+                        f"{S2_BASE}/paper/{paper_id_for_s2}",
+                        params={"fields": "openAccessPdf"},
+                        headers=s2_headers(),
+                    )
+                if s2_resp.status_code == 200:
+                    oa_pdf = s2_resp.json().get("openAccessPdf")
+                    if oa_pdf and oa_pdf.get("url"):
+                        pdf_url = oa_pdf["url"]
+            except Exception:
+                pass
+
     if not pdf_url:
         return []
 
     try:
         async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as client:
-            resp = await client.get(pdf_url)
+            resp = await client.get(pdf_url, headers={"User-Agent": BROWSER_UA})
         if resp.status_code != 200:
             return []
 
@@ -906,7 +947,10 @@ def rank_passages(passages: list, query: str) -> list:
         overlap = len(query_words & p_words)
         scored.append((overlap, p))
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [p for _, p in scored if scored[0][0] > 0] or passages
+    # Return all passages sorted by relevance, filtering only zero-overlap if there ARE overlaps
+    if scored and scored[0][0] > 0:
+        return [p for _, p in scored if _ > 0]
+    return passages
 
 
 @app.get("/health")
