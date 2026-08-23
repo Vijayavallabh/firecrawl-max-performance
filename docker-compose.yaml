@@ -70,6 +70,7 @@ x-common-env: &common-env
 
 services:
   playwright-service:
+    restart: unless-stopped
     build: ./firecrawl/apps/playwright-service-ts
     environment:
       PORT: 3000
@@ -93,6 +94,7 @@ services:
       - /tmp/.cache:noexec,nosuid,size=4g
 
   api:
+    restart: unless-stopped
     <<: *common-service
     # Keep the project's LLM configuration authoritative. Docker Compose
     # otherwise lets a host OPENAI_API_KEY override the value in .env.
@@ -123,6 +125,7 @@ services:
     memswap_limit: 64G
 
   redis:
+    restart: unless-stopped
     image: redis:alpine
     networks:
       - backend
@@ -135,6 +138,7 @@ services:
         compress: "true"
 
   rabbitmq:
+    restart: unless-stopped
     image: rabbitmq:3-management
     networks:
       - backend
@@ -153,6 +157,7 @@ services:
         compress: "true"
 
   nuq-postgres:
+    restart: unless-stopped
     build: ./firecrawl/apps/nuq-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-firecrawl}
@@ -168,6 +173,7 @@ services:
         compress: "true"
 
   foundationdb:
+    restart: unless-stopped
     image: foundationdb/foundationdb:7.3.63
     environment:
       FDB_NETWORKING_MODE: container
@@ -203,6 +209,7 @@ services:
   # Replaces DuckDuckGo direct search which gets IP-banned easily.
   # ==================================================================
   searxng:
+    restart: unless-stopped
     image: searxng/searxng:latest
     environment:
       - SEARXNG_BASE_URL=http://searxng:8080
@@ -227,6 +234,7 @@ services:
   #   search_github  -> GitHub Search API (repos + issues/PRs)
   # ==================================================================
   research-service:
+    restart: unless-stopped
     build: ./research-service
     environment:
       S2_API_KEY: ${S2_API_KEY}

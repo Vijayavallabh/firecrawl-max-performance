@@ -369,9 +369,9 @@ sed -i 's/BROWSER_POOL_SIZE: ${BROWSER_POOL_SIZE:-5}/BROWSER_POOL_SIZE: ${BROWSE
 # SearXNG env default
 sed -i 's|SEARXNG_ENDPOINT: ${SEARXNG_ENDPOINT}|SEARXNG_ENDPOINT: ${SEARXNG_ENDPOINT:-http://searxng:8080}|' "$COMPOSE" || true
 
-# Add RESEARCH_PROXY_URL env if not present
+# Add RESEARCH_PROXY_URL env if not present (default to in-stack service)
 if ! grep -q "RESEARCH_PROXY_URL" "$COMPOSE"; then
-  sed -i '/SEARXNG_CATEGORIES: ${SEARXNG_CATEGORIES}/a\  RESEARCH_PROXY_URL: ${RESEARCH_PROXY_URL}' "$COMPOSE"
+  sed -i '/SEARXNG_CATEGORIES: ${SEARXNG_CATEGORIES}/a\  RESEARCH_PROXY_URL: ${RESEARCH_PROXY_URL:-http://research-service:8000}' "$COMPOSE"
 fi
 
 # Playwright: increase concurrent pages + resources
