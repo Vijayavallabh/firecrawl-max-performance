@@ -283,12 +283,26 @@ async def crossref_lookup(doi: str) -> Optional[dict]:
         return None
 
 
+def s2_api_id(paper_id: str) -> str:
+    """Normalize a paper ID to Semantic Scholar's namespace (ArXiv:, DOI:, PMCID:, PMID:)."""
+    lower = paper_id.lower()
+    if lower.startswith("arxiv:"):
+        return "ArXiv:" + paper_id[6:]
+    if lower.startswith("pmcid:"):
+        return "PMCID:" + paper_id[6:]
+    if lower.startswith("pmid:"):
+        return "PMID:" + paper_id[5:]
+    if lower.startswith("doi:"):
+        return "DOI:" + paper_id[4:]
+    return paper_id
+
+
 async def s2_lookup(paper_id: str) -> Optional[dict]:
     """Fallback: look up a paper via Semantic Scholar Graph API."""
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             resp = await client.get(
-                f"{S2_BASE}/paper/{paper_id}",
+                f"{S2_BASE}/paper/{s2_api_id(paper_id)}",
                 params={"fields": "paperId,title,abstract,authors,year,venue,externalIds,openAccessPdf,citationCount,referenceCount"},
                 headers=s2_headers(),
             )
@@ -328,6 +342,60 @@ async def s2_lookup(paper_id: str) -> Optional[dict]:
         }
     except Exception as e:
         print(f"S2 lookup error: {e}")
+        return None
+
+
+async def europepmc_metadata_lookup(identifier: str, id_type: str = "pmcid") -> Optional[dict]:
+    """Last-resort fallback: resolve a PMCID/PMID to core metadata via Europe PMC."""
+    field = "PMCID" if id_type == "pmcid" else "EXT_ID"
+    ident = identifier.strip()
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(
+                f"{EUROPEPMC_BASE}/search",
+                params={"query": f"{field}:{ident}", "format": "json", "resultType": "core"},
+            )
+        if resp.status_code != 200:
+            return None
+        hits = (resp.json().get("resultList") or {}).get("result") or []
+        if not hits:
+            return None
+        p = hits[0]
+        ids = {}
+        if p.get("doi"):
+            ids["DOI"] = [p["doi"]]
+        if p.get("pmcid"):
+            ids["PMCID"] = [p["pmcid"]]
+        if p.get("pmid"):
+            ids["PMID"] = [str(p["pmid"])]
+        authors = [
+            {"name": name.strip()}
+            for name in (p.get("authorString") or "").split(",")
+            if name.strip()
+        ]
+        abstract = p.get("abstractText")
+        if abstract:
+            abstract = re.sub(r"<[^>]+>", " ", abstract)
+            abstract = re.sub(r"\s+", " ", abstract).strip()
+        primary = None
+        for ns in ("DOI", "ArXiv", "PMCID", "PMID"):
+            if ids.get(ns):
+                primary = f"{ns.lower()}:{ids[ns][0]}"
+                break
+        return {
+            "paperId": (p.get("pmcid") or str(p.get("pmid") or "")),
+            "primaryId": primary or f"{id_type}:{ident}",
+            "title": p.get("title"),
+            "authors": authors,
+            "abstract": abstract,
+            "categories": [p["journalTitle"]] if p.get("journalTitle") else [],
+            "createdDate": str(p.get("firstPublicationDate") or p.get("pubYear") or ""),
+            "updateDate": str(p.get("firstPublicationDate") or ""),
+            "ids": ids,
+            "openAlexId": None,
+        }
+    except Exception as e:
+        print(f"Europe PMC metadata lookup error: {e}")
         return None
 
 
@@ -740,6 +808,19 @@ async def get_paper(
                 passages = await find_passages(s2_result, {}, query, k or 4)
                 return {"success": True, "passages": passages}
             return {"success": True, "paper": s2_result}
+        # Last fallback: Europe PMC for PubMed Central / PMID identifiers
+        epmc_id = None
+        if oa_id_raw.startswith("pmcid:"):
+            epmc_id = ("pmcid", oa_id_raw[6:])
+        elif oa_id_raw.startswith("pmid:"):
+            epmc_id = ("pmid", oa_id_raw[5:])
+        if epmc_id:
+            epmc_result = await europepmc_metadata_lookup(epmc_id[1], id_type=epmc_id[0])
+            if epmc_result:
+                if query is not None:
+                    passages = await find_passages(epmc_result, {}, query, k or 4)
+                    return {"success": True, "passages": passages}
+                return {"success": True, "paper": epmc_result}
         return JSONResponse(status_code=404, content={"success": False, "error": "Paper not found"})
     if resp.status_code != 200:
         return JSONResponse(status_code=resp.status_code, content={"success": False, "error": f"OpenAlex error: {resp.text}"})
@@ -824,6 +905,177 @@ async def search_github(
         results = results[:k]
 
     return {"success": True, "results": results}
+
+
+def build_github_code_query(
+    query: str,
+    language: Optional[str] = None,
+    min_stars: Optional[int] = None,
+    max_stars: Optional[int] = None,
+    license: Optional[str] = None,
+    topic: Optional[List[str]] = None,
+    archived: Optional[bool] = None,
+    fork: Optional[bool] = None,
+    repos: Optional[List[str]] = None,
+) -> str:
+    parts = [query]
+    for r in (repos or [])[:5]:
+        parts.append(f"repo:{r.strip()}")
+    if language:
+        parts.append(f"language:{language}")
+    for t in (topic or [])[:3]:
+        parts.append(f"topic:{t.strip()}")
+    if license:
+        parts.append(f"license:{license}")
+    if min_stars is not None and max_stars is not None:
+        parts.append(f"stars:{min_stars}..{max_stars}")
+    elif min_stars is not None:
+        parts.append(f"stars:>={min_stars}")
+    elif max_stars is not None:
+        parts.append(f"stars:<={max_stars}")
+    if archived is not None:
+        parts.append("archived:true" if archived else "archived:false")
+    if fork is not None:
+        parts.append("fork:true" if fork else "fork:false")
+    return " ".join(parts)
+
+
+@app.get("/v2/code/search")
+async def code_search(
+    request: Request,
+    query: str = Query(..., min_length=1),
+    k: Optional[int] = Query(None, ge=1, le=1000),
+    types: Optional[List[str]] = Query(None),
+    repos: Optional[List[str]] = Query(None),
+    sources: Optional[List[str]] = Query(None),
+    passages: Optional[int] = Query(None, ge=1, le=5),
+    language: Optional[str] = Query(None),
+    topic: Optional[List[str]] = Query(None),
+    license: Optional[str] = Query(None),
+    min_stars: Optional[int] = Query(None, ge=0),
+    max_stars: Optional[int] = Query(None, ge=0),
+    archived: Optional[bool] = Query(None),
+    fork: Optional[bool] = Query(None),
+    origin: Optional[str] = Query(None),
+    integration: Optional[str] = Query(None),
+):
+    """Developer/code search across GitHub repos and issues/PRs.
+
+    `types`/`sources` accept: repo(s)/repo_readme, issue(s), pull_request(s)/pr(s).
+    """
+    limit = min(k or 10, 100)
+    selected = {t.strip().lower() for t in (types or []) + (sources or []) if t}
+    want_repos, want_issues, want_prs = True, True, True
+    if selected:
+        want_repos = any(t in ("repos", "repo", "repo_readme", "readme") for t in selected)
+        want_issues = any(t in ("issues", "issue") for t in selected)
+        want_prs = any(t in ("pull_requests", "pull_request", "prs", "pr") for t in selected)
+        if not (want_repos or want_issues or want_prs):
+            want_repos = want_issues = want_prs = True
+
+    ghq = build_github_code_query(
+        query,
+        language=language,
+        min_stars=min_stars,
+        max_stars=max_stars,
+        license=license,
+        topic=topic,
+        archived=archived,
+        fork=fork,
+        repos=repos,
+    )
+
+    issues_q = ghq
+    if want_prs and not want_issues:
+        issues_q += " is:pr"
+    elif want_issues and not want_prs:
+        issues_q += " is:issue"
+
+    results = []
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        repos_resp = issues_resp = None
+
+        async def fetch_repos():
+            return await client.get(
+                f"{GITHUB_BASE}/search/repositories",
+                params={"q": ghq, "per_page": min(limit, 100), "sort": "best-match"},
+                headers=gh_headers(),
+            )
+
+        async def fetch_issues():
+            return await client.get(
+                f"{GITHUB_BASE}/search/issues",
+                params={"q": issues_q, "per_page": min(limit, 100), "sort": "best-match"},
+                headers=gh_headers(),
+            )
+
+        tasks = []
+        if want_repos:
+            tasks.append(fetch_repos())
+        if want_issues or want_prs:
+            tasks.append(fetch_issues())
+
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        idx = 0
+        if want_repos:
+            repos_resp = responses[idx]
+            idx += 1
+        if want_issues or want_prs:
+            issues_resp = responses[idx]
+
+        if isinstance(repos_resp, httpx.Response) and repos_resp.status_code == 200:
+            repo_cap = min(limit, 10)
+            for repo in repos_resp.json().get("items", [])[:repo_cap]:
+                full_name = repo.get("full_name", "")
+                readme_content = ""
+                try:
+                    rd_resp = await client.get(
+                        f"{GITHUB_BASE}/repos/{full_name}/readme",
+                        headers={**gh_headers(), "Accept": "application/vnd.github.v3.raw"},
+                    )
+                    if rd_resp.status_code == 200:
+                        readme_content = rd_resp.text[:10000]
+                except Exception:
+                    pass
+                stars = repo.get("stargazers_count", 0)
+                lang = repo.get("language") or ""
+                header = (
+                    f"# {repo.get('full_name', '')}\n\n"
+                    f"{repo.get('description') or ''}\n\n"
+                    f"- Stars: {stars} | Language: {lang} | "
+                    f"License: {(repo.get('license') or {}).get('spdx_id') or 'none'}\n"
+                )
+                results.append({
+                    "repo": full_name,
+                    "resultType": "repo_readme",
+                    "url": repo.get("html_url", ""),
+                    "readmeUrl": repo.get("html_url", "") + "#readme",
+                    "snippet": repo.get("description", ""),
+                    "contentMd": header + "\n" + readme_content,
+                    "stars": stars,
+                    "language": lang,
+                    "topics": repo.get("topics", []),
+                })
+
+        if isinstance(issues_resp, httpx.Response) and issues_resp.status_code == 200:
+            for item in issues_resp.json().get("items", []):
+                repo_url = item.get("repository_url", "")
+                repo_name = repo_url.replace("https://api.github.com/repos/", "") if repo_url else ""
+                is_pr = "pull_request" in item
+                body = (item.get("body") or "").strip()[:10000]
+                results.append({
+                    "repo": repo_name,
+                    "resultType": "pull_request" if is_pr else "issue",
+                    "number": item.get("number"),
+                    "pageType": "pull_request" if is_pr else "issue",
+                    "url": item.get("html_url", ""),
+                    "snippet": item.get("title", ""),
+                    "contentMd": body,
+                })
+
+    results.sort(key=lambda r: r.get("stars", 0), reverse=True)
+
+    return {"success": True, "query": ghq, "count": len(results), "results": results[: k or limit]}
 
 
 async def find_passages(result: dict, work: dict, question: str, num_passages: int) -> list:

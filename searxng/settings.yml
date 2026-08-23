@@ -32,3 +32,19 @@ engines:
     engine: wikipedia
     shortcut: wp
     disabled: false
+  - name: google news
+    engine: google_news
+    shortcut: gnews
+    disabled: false
+  - name: bing news
+    engine: bing_news
+    shortcut: bnews
+    disabled: false
+  - name: google images
+    engine: google_images
+    shortcut: goimg
+    disabled: false
+  - name: bing images
+    engine: bing_images
+    shortcut: bimg
+    disabled: false

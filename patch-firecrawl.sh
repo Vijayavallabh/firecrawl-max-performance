@@ -736,6 +736,121 @@ export async function agentCancelController(
 AGENTCANCELTS
 echo "  Done."
 
+# ── 11. SearXNG per-source search (news/images buckets) ───────────────
+echo "[11/11] Patching SearXNG source-type support..."
+SEARXNG_SOURCES="$FIRECRAWL_DIR/apps/api/src/search/v2/searxng-sources.ts"
+cat > "$SEARXNG_SOURCES" << 'SEARXNGSOURCES'
+import axios from "axios";
+import { config } from "../../config";
+import { SearchV2Response, SearchResultType } from "../../lib/entities";
+import { logger } from "../../lib/logger";
+
+const CATEGORY_BY_TYPE: Record<SearchResultType, string> = {
+  web: "general",
+  news: "news",
+  images: "images",
+};
+
+async function searchCategory(
+  q: string,
+  category: string,
+  lang?: string,
+): Promise<any[]> {
+  const base = (config.SEARXNG_ENDPOINT ?? "").replace(/\/+$/, "");
+  if (!base) return [];
+  try {
+    const response = await axios.get(base + "/search", {
+      headers: { "Content-Type": "application/json" },
+      params: {
+        q,
+        language: lang,
+        // Only pin engines for general web search — an explicit engine list
+        // would override the category and force general engines even when
+        // searching news or images.
+        engines:
+          category === "general" ? config.SEARXNG_ENGINES ?? "" : "",
+        categories: category,
+        pageno: 1,
+        format: "json",
+      },
+    });
+    const data = response.data;
+    return Array.isArray(data?.results) ? data.results : [];
+  } catch (error) {
+    logger.error(`SearXNG ${category} search failed`, { error });
+    return [];
+  }
+}
+
+/**
+ * Runs one SearXNG query per requested source type (web/news/images), each
+ * with its own SearXNG category, and buckets the results accordingly.
+ */
+export async function searxngSearchV2(
+  q: string,
+  numResults: number,
+  types?: SearchResultType[],
+  lang?: string,
+): Promise<SearchV2Response> {
+  const requested: SearchResultType[] =
+    types && types.length > 0
+      ? types.filter(t => t === "web" || t === "news" || t === "images")
+      : ["web"];
+  const capped = Math.max(1, Math.min(numResults, 100));
+
+  const buckets = await Promise.all(
+    requested.map(async t => ({
+      type: t,
+      items: await searchCategory(q, CATEGORY_BY_TYPE[t], lang),
+    })),
+  );
+
+  const out: SearchV2Response = {};
+  for (const { type, items } of buckets) {
+    if (!Array.isArray(items)) continue;
+    if (type === "images") {
+      const images: SearchV2Response["images"] = items
+        .slice(0, capped)
+        .map((a: any) => ({
+          title: a.title,
+          imageUrl: a.img_src ?? a.thumbnail_src ?? a.url,
+          url: a.url,
+          position: a.position,
+        }));
+      out.images = images;
+    } else if (type === "news") {
+      const news: SearchV2Response["news"] = items
+        .slice(0, capped)
+        .map((a: any) => ({
+          title: a.title,
+          url: a.url,
+          snippet: a.content ?? "",
+          date: a.publishedDate,
+          position: a.position,
+        }));
+      out.news = news;
+    } else {
+      const web: SearchV2Response["web"] = items
+        .slice(0, capped)
+        .map((a: any) => ({
+          url: a.url,
+          title: a.title,
+          description: typeof a.content === "string" ? a.content : "",
+        }));
+      out.web = web;
+    }
+  }
+  return out;
+}
+SEARXNGSOURCES
+
+V2_SEARCH_INDEX="$FIRECRAWL_DIR/apps/api/src/search/v2/index.ts"
+if ! grep -q "searxngSearchV2" "$V2_SEARCH_INDEX"; then
+  perl -0777 -pi -e 's/import \{ searxng_search \} from "\.\/searxng";/import { searxngSearchV2 } from ".\/searxng-sources";/' "$V2_SEARCH_INDEX"
+  perl -0777 -pi -e 's/if \(config\.SEARXNG_ENDPOINT\) \{\n      logger\.info\("Using searxng search"\);\n      const results = await searxng_search\(query, \{\n        num_results,\n        tbs,\n        filter,\n        lang,\n        country,\n        location,\n        safe,\n      \}\);\n      if \(results\.web && results\.web\.length > 0\) return results;\n    \}/if (config.SEARXNG_ENDPOINT) {\n      logger.info("Using searxng search");\n      const requestedTypes = Array.isArray(type)\n        ? type\n        : type\n          ? [type]\n          : undefined;\n      const results = await searxngSearchV2(\n        query,\n        num_results,\n        requestedTypes,\n        lang,\n      );\n      if (results.web?.length || results.news?.length || results.images?.length) {\n        return results;\n      }\n    }/' "$V2_SEARCH_INDEX"
+fi
+echo "  Done."
+
 echo ""
 echo "========================================"
 echo "All patches applied successfully!"
