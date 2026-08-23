@@ -24,6 +24,7 @@ cat > "$FIRECRAWL_DIR/apps/api/src/services/rate-limiter.ts" << 'RATELIMITER'
 import { RateLimiterRedis } from "rate-limiter-flexible";
 import { config } from "../config";
 import { RateLimiterMode } from "../types";
+import type { TeamFlags } from "../controllers/v1/types";
 import Redis from "ioredis";
 
 export const redisRateLimitClient = new Redis(config.REDIS_RATE_LIMIT_URL!, {
@@ -77,9 +78,21 @@ export function getRateLimiter(mode: RateLimiterMode): RateLimiterRedis {
   return createRateLimiter(`${mode}`, rateLimit);
 }
 
+export function getRateLimitOverride(
+  mode: RateLimiterMode,
+  overrides: unknown,
+): number | undefined {
+  if (typeof overrides !== "object" || overrides === null) return undefined;
+  const value = (overrides as Record<string, unknown>)[mode];
+  if (typeof value !== "number") return undefined;
+  if (!Number.isInteger(value) || value <= 0) return undefined;
+  return value;
+}
+
 export function getAutumnRateLimiter(
   mode: RateLimiterMode,
   multiplier: number = 1,
+  _flags?: TeamFlags | null,
 ): RateLimiterRedis {
   const base = BASE_RATE_LIMITS[mode];
   let rateLimit: number;
@@ -376,6 +389,10 @@ sed -i 's/    memswap_limit: 8G/    memswap_limit: 64G/' "$COMPOSE" || true
 # Startup timeout
 sed -i 's/HARNESS_STARTUP_TIMEOUT_MS: ${HARNESS_STARTUP_TIMEOUT_MS:-60000}/HARNESS_STARTUP_TIMEOUT_MS: ${HARNESS_STARTUP_TIMEOUT_MS:-120000}/' "$COMPOSE" || true
 
+# Restart policy: keep all long-running services up across reboots
+# (foundationdb-init stays one-shot).
+perl -0777 -pi -e 's/^  (playwright-service|api|redis|rabbitmq|nuq-postgres|foundationdb|searxng|research-service):\n(?![ \t]*restart:)/  ${1}:\n    restart: unless-stopped\n/gm' "$COMPOSE"
+
 # Add SearXNG + research-service services and searxng volume if not present
 if ! grep -q "  searxng:" "$COMPOSE"; then
   sed -i '/^networks:/i\  searxng:\n    image: searxng/searxng:latest\n    environment:\n      - SEARXNG_BASE_URL=http://searxng:8080\n      - SEARXNG_SECRET=${SEARXNG_SECRET:-firecrawl-secret-key}\n    networks:\n      - backend\n    volumes:\n      - ./searxng-settings.yml:/etc/searxng/settings.yml:ro\n    logging:\n      driver: "json-file"\n      options:\n        max-size: "5m"\n        max-file: "2"\n        compress: "true"\n\n  research-service:\n    build: apps/research-service\n    environment:\n      S2_API_KEY: ${S2_API_KEY}\n      GITHUB_TOKEN: ${GITHUB_TOKEN}\n      MAILTO: ${MAILTO:-research@firecrawl.local}\n    networks:\n      - backend\n    mem_limit: 16G\n    memswap_limit: 16G\n    logging:\n      driver: "json-file"\n      options:\n        max-size: "5m"\n        max-file: "2"\n        compress: "true"\n' "$COMPOSE"
@@ -470,7 +487,7 @@ fi
 
 F0_URL="$FIRECRAWL_DIR/apps/api/src/lib/extract/fire-0/url-processor-f0.ts"
 if ! grep -q "getModelFast" "$F0_URL"; then
-  sed -i 's/import { getModel } from "..\/generic-ai";/import { getModel, getModelFast } from "..\/generic-ai";/' "$F0_URL" 2>/dev/null || true
+  sed -i 's/import { getModel } from "..\/..\/generic-ai";/import { getModel, getModelFast } from "..\/..\/generic-ai";/' "$F0_URL" 2>/dev/null || true
   sed -i 's/model: getModel("gpt-4o-mini"),/model: getModelFast("gpt-4o-mini"),/' "$F0_URL" 2>/dev/null || true
 fi
 
@@ -484,8 +501,9 @@ fi
 RESEARCH_MGR="$FIRECRAWL_DIR/apps/api/src/lib/deep-research/research-manager.ts"
 if ! grep -q "getModelFast" "$RESEARCH_MGR"; then
   sed -i 's/import { getModel } from "..\/generic-ai";/import { getModel, getModelFast } from "..\/generic-ai";/' "$RESEARCH_MGR" 2>/dev/null || true
-  sed -i '0,/markdown: "",$/s//markdown: "",\n      model: getModelFast("gpt-4o-mini", "openai"),/' "$RESEARCH_MGR" 2>/dev/null || true
-  sed -i '0,/markdown: "",$/s//markdown: "",\n        model: getModelFast("gpt-4o-mini", "openai"),/' "$RESEARCH_MGR" 2>/dev/null || true
+  # Insert a model line after the first two `markdown: "",` option sites,
+  # preserving indentation. A single pass avoids duplicate-key errors.
+  perl -0777 -pi -e 'BEGIN{$c=0} s/^([ \t]*)markdown: "",\n/$c++; $c <= 2 ? "${1}markdown: \"\",\n${1}model: getModelFast(\"gpt-4o-mini\", \"openai\"),\n" : $&/gme' "$RESEARCH_MGR" 2>/dev/null || true
 fi
 
 # 9g. Route llms.txt generation to fast model
@@ -505,7 +523,7 @@ fi
 # 9i. Route deterministic JSON to fast model via openai provider
 DJ_CLIENT="$FIRECRAWL_DIR/apps/api/src/lib/deterministicJson/llm/client.ts"
 if ! grep -q "getModelFast" "$DJ_CLIENT"; then
-  sed -i 's/import { getModel } from "..\/generic-ai";/import { getModel, getModelFast } from "..\/generic-ai";/' "$DJ_CLIENT" 2>/dev/null || true
+  sed -i 's/import { getModel } from "..\/..\/generic-ai";/import { getModel, getModelFast } from "..\/..\/generic-ai";/' "$DJ_CLIENT" 2>/dev/null || true
   sed -i 's/model: getModel(CODEGEN_MODEL, "vertex"),/model: getModelFast(CODEGEN_MODEL, "openai"),/' "$DJ_CLIENT" 2>/dev/null || true
   sed -i 's/model: getModel(ANCHOR_MODEL, "groq"),/model: getModelFast(ANCHOR_MODEL, "openai"),/' "$DJ_CLIENT" 2>/dev/null || true
   sed -i 's/model: getModel(LIGHT_MODEL, "groq"),/model: getModelFast(LIGHT_MODEL, "openai"),/' "$DJ_CLIENT" 2>/dev/null || true
