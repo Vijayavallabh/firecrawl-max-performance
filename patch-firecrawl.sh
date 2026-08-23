@@ -389,10 +389,6 @@ sed -i 's/    memswap_limit: 8G/    memswap_limit: 64G/' "$COMPOSE" || true
 # Startup timeout
 sed -i 's/HARNESS_STARTUP_TIMEOUT_MS: ${HARNESS_STARTUP_TIMEOUT_MS:-60000}/HARNESS_STARTUP_TIMEOUT_MS: ${HARNESS_STARTUP_TIMEOUT_MS:-120000}/' "$COMPOSE" || true
 
-# Restart policy: keep all long-running services up across reboots
-# (foundationdb-init stays one-shot).
-perl -0777 -pi -e 's/^  (playwright-service|api|redis|rabbitmq|nuq-postgres|foundationdb|searxng|research-service):\n(?![ \t]*restart:)/  ${1}:\n    restart: unless-stopped\n/gm' "$COMPOSE"
-
 # Add SearXNG + research-service services and searxng volume if not present
 if ! grep -q "  searxng:" "$COMPOSE"; then
   sed -i '/^networks:/i\  searxng:\n    image: searxng/searxng:latest\n    environment:\n      - SEARXNG_BASE_URL=http://searxng:8080\n      - SEARXNG_SECRET=${SEARXNG_SECRET:-firecrawl-secret-key}\n    networks:\n      - backend\n    volumes:\n      - ./searxng-settings.yml:/etc/searxng/settings.yml:ro\n    logging:\n      driver: "json-file"\n      options:\n        max-size: "5m"\n        max-file: "2"\n        compress: "true"\n\n  research-service:\n    build: apps/research-service\n    environment:\n      S2_API_KEY: ${S2_API_KEY}\n      GITHUB_TOKEN: ${GITHUB_TOKEN}\n      MAILTO: ${MAILTO:-research@firecrawl.local}\n    networks:\n      - backend\n    mem_limit: 16G\n    memswap_limit: 16G\n    logging:\n      driver: "json-file"\n      options:\n        max-size: "5m"\n        max-file: "2"\n        compress: "true"\n' "$COMPOSE"
@@ -403,6 +399,11 @@ fi
 if [ ! -f "$FIRECRAWL_DIR/searxng-settings.yml" ] && [ -f "$SCRIPT_DIR/searxng/settings.yml" ]; then
   cp "$SCRIPT_DIR/searxng/settings.yml" "$FIRECRAWL_DIR/searxng-settings.yml"
 fi
+
+# Restart policy: keep all long-running services up across reboots
+# (foundationdb-init stays one-shot). Must run after the searxng /
+# research-service blocks above are appended.
+perl -0777 -pi -e 's/^  (playwright-service|api|redis|rabbitmq|nuq-postgres|foundationdb|searxng|research-service):\n(?![ \t]*restart:)/  ${1}:\n    restart: unless-stopped\n/gm' "$COMPOSE"
 echo "  Done."
 
 # ── 7. Patch MCP server (if installed via npx cache) ─────────────────
