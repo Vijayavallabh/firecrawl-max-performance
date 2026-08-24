@@ -470,6 +470,25 @@ async def resolve_oa_id(paper_id: str) -> Optional[str]:
             return resp.json().get("id", "").rsplit("/", 1)[-1]
     except Exception:
         pass
+    # Title fallback: treat unrecognized identifiers as a paper title search so
+    # callers can pass titles directly instead of guessing opaque IDs.
+    if not re.match(r"^(arxiv:|doi:|pmid:|pmcid:|corpusid:|W\d)", paper_id.strip(), re.I):
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                resp = await client.get(
+                    f"{OPENALEX_BASE}/works",
+                    params=oa_params({
+                        "filter": f"title.search:{paper_id.strip()}",
+                        "per_page": 1,
+                        "select": "id,title",
+                    }),
+                )
+            if resp.status_code == 200:
+                hits = resp.json().get("results", [])
+                if hits:
+                    return hits[0].get("id", "").rsplit("/", 1)[-1]
+        except Exception:
+            pass
     return None
 
 
@@ -743,7 +762,19 @@ async def similar_papers(
     if k:
         results = results[:k]
 
-    return {"success": True, "results": results, "poolSize": pool_size}
+    # Surface what the seed actually resolved to so callers can catch
+    # wrong-ID mistakes immediately (e.g. an arXiv id pointing at a
+    # different paper than intended).
+    return {
+        "success": True,
+        "results": results,
+        "poolSize": pool_size,
+        "seed": {
+            "requested": paper_id,
+            "openalexId": oa_id,
+            "resolvedTitle": work.get("title"),
+        },
+    }
 
 
 @app.get("/v2/research/papers/{paper_id:path}")

@@ -65,6 +65,21 @@ else
 fi
 echo ""
 
+# Hybrid local-Postgres persistence is enabled whenever DATABASE_URL is set.
+# Derive it from the same credentials used by nuq-postgres unless the user
+# already supplied a custom URL.
+if ! grep -q '^DATABASE_URL=' .env; then
+  DB_USER=$(grep '^POSTGRES_USER=' .env | cut -d= -f2-)
+  DB_PASSWORD=$(grep '^POSTGRES_PASSWORD=' .env | cut -d= -f2-)
+  DB_NAME=$(grep '^POSTGRES_DB=' .env | cut -d= -f2-)
+  DB_USER_URL=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$DB_USER")
+  DB_PASSWORD_URL=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$DB_PASSWORD")
+  DB_NAME_URL=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$DB_NAME")
+  printf '\nDATABASE_URL=postgres://%s:%s@nuq-postgres:5432/%s\n' \
+    "$DB_USER_URL" "$DB_PASSWORD_URL" "$DB_NAME_URL" >> .env
+  echo "Configured DATABASE_URL for local Postgres persistence."
+fi
+
 # ── Build and start ──────────────────────────────────────────────────
 echo "Ready to build and start?"
 echo "  1. Edit .env with your API keys"
@@ -86,6 +101,9 @@ if [ "${1:-}" = "--start" ]; then
   echo ""
   echo "Waiting for services to start..."
   sleep 15
+  echo ""
+  echo "Initializing local Postgres schema (monitors/feedback/sessions)..."
+  bash "$SCRIPT_DIR/init-db.sh" || echo "  (DB init skipped — run init-db.sh later)"
   echo ""
   echo "Checking service health..."
   curl -s http://localhost:3002/ | head -c 100

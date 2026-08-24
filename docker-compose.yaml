@@ -34,6 +34,7 @@ x-common-env: &common-env
   POSTGRES_HOST: ${POSTGRES_HOST:-nuq-postgres}
   POSTGRES_PORT: ${POSTGRES_PORT:-5432}
   USE_DB_AUTHENTICATION: ${USE_DB_AUTHENTICATION:-false}
+  DATABASE_URL: ${DATABASE_URL:-}
 
   # --- Performance tuning (maxed out) ---
   NUM_WORKERS_PER_QUEUE: ${NUM_WORKERS_PER_QUEUE:-32}

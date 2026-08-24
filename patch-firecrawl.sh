@@ -737,7 +737,7 @@ AGENTCANCELTS
 echo "  Done."
 
 # ── 11. SearXNG per-source search (news/images buckets) ───────────────
-echo "[11/11] Patching SearXNG source-type support..."
+echo "[11/13] Patching SearXNG source-type support..."
 SEARXNG_SOURCES="$FIRECRAWL_DIR/apps/api/src/search/v2/searxng-sources.ts"
 cat > "$SEARXNG_SOURCES" << 'SEARXNGSOURCES'
 import axios from "axios";
@@ -783,6 +783,52 @@ async function searchCategory(
 }
 
 /**
+ * Extracts a publication date from common URL patterns (/2026/03/,
+ * /2026-03-15/, /20260305/, ?date=2026-03-15) as a fallback when the
+ * engine does not supply one — most news engines omit publishedDate.
+ */
+function dateFromUrl(url?: string): string | undefined {
+  if (!url) return undefined;
+  let m =
+    url.match(/\/(20\d{2})\/(0?[1-9]|1[0-2])\/(0?[1-9]|[12]\d|3[01])(?=\/|\b)/) ||
+    url.match(/(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])/) ||
+    url.match(/\/(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\//);
+  if (!m) {
+    // minimal forms: /YYYY/MM/ or YYYY-MM (no day available)
+    m = url.match(/(20\d{2})\/(0[1-9]|1[0-2])\//) ||
+        url.match(/(20\d{2})-(0[1-9]|1[0-2])(?!-\d)/);
+    if (m) return `${m[1]}-${m[2]}`;
+    return undefined;
+  }
+  return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+}
+
+/**
+ * Lexical relevance ordering: ranks results by query-token overlap in
+ * title/snippet and drops zero-overlap noise (e.g. unrelated SEO pages that
+ * general SearXNG engines sometimes inject). Falls back to original order
+ * when nothing overlaps, so unusual queries never empty out.
+ */
+function relevanceOrder(q: string, items: any[]): any[] {
+  const tokens = new Set(
+    ((q ?? "").toLowerCase().match(/[a-z0-9]+/g) ?? []).filter(t => t.length > 2),
+  );
+  if (tokens.size === 0 || !Array.isArray(items)) return items;
+  const scored = items.map((item, idx) => {
+    const text = `${item.title ?? ""} ${item.content ?? ""}`.toLowerCase();
+    let score = 0;
+    for (const t of tokens) {
+      if (text.includes(t)) score += 1;
+    }
+    return { item, score, idx };
+  });
+  scored.sort((a, b) => b.score - a.score || a.idx - b.idx);
+  const relevant = scored.filter(s => s.score > 0);
+  const ordered = relevant.length > 0 ? relevant : scored;
+  return ordered.map(s => s.item);
+}
+
+/**
  * Runs one SearXNG query per requested source type (web/news/images), each
  * with its own SearXNG category, and buckets the results accordingly.
  */
@@ -819,18 +865,18 @@ export async function searxngSearchV2(
         }));
       out.images = images;
     } else if (type === "news") {
-      const news: SearchV2Response["news"] = items
+      const news: SearchV2Response["news"] = relevanceOrder(q, items)
         .slice(0, capped)
         .map((a: any) => ({
           title: a.title,
           url: a.url,
           snippet: a.content ?? "",
-          date: a.publishedDate,
+          date: a.publishedDate ?? dateFromUrl(a.url),
           position: a.position,
         }));
       out.news = news;
     } else {
-      const web: SearchV2Response["web"] = items
+      const web: SearchV2Response["web"] = relevanceOrder(q, items)
         .slice(0, capped)
         .map((a: any) => ({
           url: a.url,
@@ -852,13 +898,121 @@ fi
 echo "  Done."
 
 # ── 12. Remove agent content truncation ──────────────────────────────
-echo "[12/12] Removing agent scrape/content char caps..."
+echo "[12/13] Removing agent scrape/content char caps..."
 AGENT_TS="$FIRECRAWL_DIR/apps/api/src/controllers/v2/agent.ts"
 if grep -q "md.slice(0, 8000)" "$AGENT_TS"; then
   sed -i 's|scrapedContent.push(`## Content from ${url}\\n\\n${md.slice(0, 8000)}`);|scrapedContent.push(`## Content from ${url}\\n\\n${md}`);|' "$AGENT_TS"
   sed -i 's|scrapedContent.push(`## Content from ${result.url}\\n\\n${md.slice(0, 8000)}`);|scrapedContent.push(`## Content from ${result.url}\\n\\n${md}`);|' "$AGENT_TS"
 fi
 sed -i 's|const allContent = scrapedContent.join("\\n\\n---\\n\\n").slice(0, 50000);|const allContent = scrapedContent.join("\\n\\n---\\n\\n");|' "$AGENT_TS"
+echo "  Done."
+
+
+# ── 13. Hybrid local-PG persistence (monitors/feedback/interact/telemetry) ──
+echo "[13/13] Enabling hybrid local Postgres persistence..."
+DB_CONN="$FIRECRAWL_DIR/apps/api/src/db/connection.ts"
+python3 - "$DB_CONN" << 'PYCONN'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace(
+"""const mainDb = useDbAuthentication
+  ? makeDb(config.DATABASE_URL, "firecrawl-api")
+  : null;
+const replicaDb = useDbAuthentication
+  ? makeDb(
+      config.DATABASE_REPLICA_URL ?? config.DATABASE_URL,
+      "firecrawl-api-rr",
+    )
+  : null;""",
+"""// Hybrid mode: even when hosted-style DB auth is disabled, initialize the
+// drizzle clients whenever DATABASE_URL exists so self-hosted deployments can
+// persist monitors, feedback, browser sessions and request telemetry against
+// their own local Postgres.
+const dbPersistence = useDbAuthentication || !!config.DATABASE_URL;
+
+const mainDb = dbPersistence
+  ? makeDb(config.DATABASE_URL, "firecrawl-api")
+  : null;
+const replicaDb = dbPersistence
+  ? makeDb(
+      config.DATABASE_REPLICA_URL ?? config.DATABASE_URL,
+      "firecrawl-api-rr",
+    )
+  : null;""")
+s = s.replace("if (useDbAuthentication && !mainDb) {", "if (dbPersistence && !mainDb) {")
+open(p, "w").write(s)
+PYCONN
+
+LOG_JOB="$FIRECRAWL_DIR/apps/api/src/services/logging/log_job.ts"
+perl -0777 -pi -e 's/if \(config\.USE_DB_AUTHENTICATION !== true\) \{
+    logger\.info\(
+      "Skipping database insertion due to USE_DB_AUTHENTICATION being off",
+    \);
+    return;
+  \}/if (config.USE_DB_AUTHENTICATION !== true \&\& !config.DATABASE_URL) {
+    logger.info(
+      "Skipping database insertion due to USE_DB_AUTHENTICATION being off",
+    );
+    return;
+  }/' "$LOG_JOB"
+
+BROWSER_TS="$FIRECRAWL_DIR/apps/api/src/controllers/v2/scrape-browser.ts"
+perl -0777 -pi -e 's/if \(config\.USE_DB_AUTHENTICATION !== true\) \{
+    return res\.status\(501\)\.json\(\{
+      success: false,
+      error:
+        "Scrape interact requires stored scrape context and is not available when database authentication is disabled\.",
+    \}\);
+  \}/if (config.USE_DB_AUTHENTICATION !== true \&\& !config.DATABASE_URL) {
+    return res.status(501).json({
+      success: false,
+      error:
+        "Scrape interact requires stored scrape context and is not available when database authentication is disabled.",
+    });
+  }/' "$BROWSER_TS"
+
+FEEDBACK_TS="$FIRECRAWL_DIR/apps/api/src/controllers/v2/feedback/record.ts"
+perl -0777 -pi -e 's/if \(config\.USE_DB_AUTHENTICATION !== true\) \{
+    return feedbackFailure\(
+      503,
+      "DB_DISABLED",/if (config.USE_DB_AUTHENTICATION !== true \&\& !config.DATABASE_URL) {
+    return feedbackFailure(
+      503,
+      "DB_DISABLED",/' "$FEEDBACK_TS"
+
+CRAWL_STATUS="$FIRECRAWL_DIR/apps/api/src/controllers/v2/crawl-status.ts"
+sed -i 's|creditsUsed: creditsBilled?.\[0\]?.credits_billed ?? -1,|creditsUsed: creditsBilled?.[0]?.credits_billed ?? numericStats.completed ?? 0,|' "$CRAWL_STATUS"
+
+V2_ROUTES="$FIRECRAWL_DIR/apps/api/src/routes/v2.ts"
+sed -i '/deprecationMiddleware("v2_extract"),/d; /deprecationMiddleware("v2_extract_status"),/d' "$V2_ROUTES"
+
+QW_TS="$FIRECRAWL_DIR/apps/api/src/services/queue-worker.ts"
+python3 - "$QW_TS" << 'PYQW'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace(
+  "if (config.USE_DB_AUTHENTICATION && !config.DISABLE_MONITORING) {",
+  "if (\n    (config.USE_DB_AUTHENTICATION || config.DATABASE_URL) &&\n    !config.DISABLE_MONITORING\n  ) {")
+open(p, "w").write(s)
+PYQW
+
+DEPREC="$FIRECRAWL_DIR/apps/api/src/lib/deprecations.ts"
+python3 - "$DEPREC" << 'PYDEP'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s = re.sub(
+  r"""  v2_extract: \{.*?\},
+  v2_extract_status: \{.*?\},""",
+  "  // v2 extract deprecation notices intentionally removed for self-hosted\n"
+  "  // deployments: the firecrawl-mcp client still uses /v2/extract and the\n"
+  "  // warning surfaces as noise in every MCP tool result.",
+  s, flags=re.S)
+open(p, "w").write(s)
+PYDEP
+
 echo "  Done."
 
 echo ""

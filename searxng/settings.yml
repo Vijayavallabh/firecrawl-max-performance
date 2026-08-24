@@ -35,11 +35,11 @@ engines:
   - name: google news
     engine: google_news
     shortcut: gnews
-    disabled: false
+    disabled: true
   - name: bing news
     engine: bing_news
     shortcut: bnews
-    disabled: false
+    disabled: true
   - name: google images
     engine: google_images
     shortcut: goimg
