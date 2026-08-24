@@ -32,6 +32,13 @@ sed -i 's/k: z2.number().int().min(1).max(50).optional().describe("Number of pas
 # search_github k.max: 100 -> 1000
 sed -i 's/k: z2.number().int().min(1).max(100).optional()/k: z2.number().int().min(1).max(1000).optional()/' "$MCP_JS"
 
+# Remove character/token truncation of tool results:
+sed -i 's/var MAX_AUTHORS = 15;/var MAX_AUTHORS = 500;/' "$MCP_JS"
+sed -i 's/var MAX_ABSTRACT_CHARS = 600;/var MAX_ABSTRACT_CHARS = 200000;/' "$MCP_JS"
+sed -i 's/var MAX_AFFIL_CHARS = 60;/var MAX_AFFIL_CHARS = 4000;/' "$MCP_JS"
+sed -i 's/var MAX_AUTHORS_LINE_CHARS = 400;/var MAX_AUTHORS_LINE_CHARS = 40000;/' "$MCP_JS"
+sed -i 's/var MAX_GITHUB_CONTENT_CHARS = 1200;/var MAX_GITHUB_CONTENT_CHARS = 500000;/' "$MCP_JS"
+
 # JS SDK HTTP timeout: 300s -> 600s
 SDK_JS=$(dirname "$(dirname "$MCP_JS")")/@mendable/firecrawl-js/dist/index.js 2>/dev/null || true
 if [ -f "$SDK_JS" ]; then
@@ -45,6 +52,7 @@ echo "  - search_papers k.max: 500 -> 10000"
 echo "  - related_papers seed_ids.max: 10 -> 20"
 echo "  - read_paper k.max: 50 -> 500"
 echo "  - search_github k.max: 100 -> 1000"
+echo "  - abstract/authors/github content char caps: removed (200k/40k/500k)"
 echo "  - HTTP timeout: 300s -> 600s"
 echo ""
 echo "Restart opencode for changes to take effect."

@@ -872,7 +872,7 @@ async def search_github(
                         headers={**gh_headers(), "Accept": "application/vnd.github.v3.raw"},
                     )
                     if rd_resp.status_code == 200:
-                        readme_content = rd_resp.text[:10000]
+                        readme_content = rd_resp.text[:100000]
                 except Exception:
                     pass
                 results.append({
@@ -890,7 +890,7 @@ async def search_github(
                 repo_url = item.get("repository_url", "")
                 repo_name = repo_url.replace("https://api.github.com/repos/", "") if repo_url else ""
                 is_pr = "pull_request" in item
-                body = (item.get("body") or "").strip()[:10000]
+                body = (item.get("body") or "").strip()[:100000]
                 results.append({
                     "repo": repo_name,
                     "resultType": "pr" if is_pr else "issue",
@@ -1034,7 +1034,7 @@ async def code_search(
                         headers={**gh_headers(), "Accept": "application/vnd.github.v3.raw"},
                     )
                     if rd_resp.status_code == 200:
-                        readme_content = rd_resp.text[:10000]
+                        readme_content = rd_resp.text[:100000]
                 except Exception:
                     pass
                 stars = repo.get("stargazers_count", 0)
@@ -1062,7 +1062,7 @@ async def code_search(
                 repo_url = item.get("repository_url", "")
                 repo_name = repo_url.replace("https://api.github.com/repos/", "") if repo_url else ""
                 is_pr = "pull_request" in item
-                body = (item.get("body") or "").strip()[:10000]
+                body = (item.get("body") or "").strip()[:100000]
                 results.append({
                     "repo": repo_name,
                     "resultType": "pull_request" if is_pr else "issue",

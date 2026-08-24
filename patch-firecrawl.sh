@@ -851,6 +851,16 @@ if ! grep -q "searxngSearchV2" "$V2_SEARCH_INDEX"; then
 fi
 echo "  Done."
 
+# ── 12. Remove agent content truncation ──────────────────────────────
+echo "[12/12] Removing agent scrape/content char caps..."
+AGENT_TS="$FIRECRAWL_DIR/apps/api/src/controllers/v2/agent.ts"
+if grep -q "md.slice(0, 8000)" "$AGENT_TS"; then
+  sed -i 's|scrapedContent.push(`## Content from ${url}\\n\\n${md.slice(0, 8000)}`);|scrapedContent.push(`## Content from ${url}\\n\\n${md}`);|' "$AGENT_TS"
+  sed -i 's|scrapedContent.push(`## Content from ${result.url}\\n\\n${md.slice(0, 8000)}`);|scrapedContent.push(`## Content from ${result.url}\\n\\n${md}`);|' "$AGENT_TS"
+fi
+sed -i 's|const allContent = scrapedContent.join("\\n\\n---\\n\\n").slice(0, 50000);|const allContent = scrapedContent.join("\\n\\n---\\n\\n");|' "$AGENT_TS"
+echo "  Done."
+
 echo ""
 echo "========================================"
 echo "All patches applied successfully!"
