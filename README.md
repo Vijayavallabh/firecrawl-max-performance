@@ -2,24 +2,24 @@
 
 Complete self-hosting package for [Firecrawl](https://github.com/firecrawl/firecrawl) with:
 
-- **No rate limits** on any of the 14 working features
+- **Self-hosted throughput** with explicit safety bounds and no hosted API quota
 - **Custom research service** (6 endpoints: search_papers, inspect_paper, read_paper, related_papers, search_github, developer_search)
 - **SearXNG** meta-search backend (Google + Bing + DuckDuckGo + Wikipedia)
 - **Dual LLM model strategy** — heavy model for extraction, fast model for schema generation, summaries, reranking, and codegen
 - **DeepSeek-V4-Flash-0731** as default LLM (284B MoE, $0.14/1M tokens, 1M context, fast+cheap)
 - **Fireworks AI** as the LLM backend for JSON extraction (or any OpenAI-compatible API)
-- **Maxed-out Docker resources** (32 workers, 50 concurrent crawls, 20 browser instances)
+- **Tuned Docker resources** (32 NuQ workers, 50 local concurrency, 20 browser sessions)
 
 ## Quick Start
 
 ```bash
-# 1. Run setup (clones Firecrawl, applies patches)
+# 1. Run setup (clones a pinned Firecrawl revision and applies patches)
 ./setup.sh
 
 # 2. Edit .env with your API keys
 nano .env
 
-# 3. Build and start
+# 3. Build and start; schema initialization is a startup dependency
 ./setup.sh --start
 ```
 
@@ -29,6 +29,12 @@ nano .env
 - git, curl
 - A Fireworks AI API key (or any OpenAI-compatible API key)
 - Recommended: 16+ CPU cores, 64GB+ RAM
+- Host tools: `curl`, `python3`, `perl`, `openssl`, and Node.js 18+ for MCP patching
+
+The API is published on `127.0.0.1` by default because self-host mode sets
+`USE_DB_AUTHENTICATION=false`. If the API must be reachable remotely, put it
+behind an authenticated reverse proxy/firewall and set `HOST_BIND_ADDRESS`
+deliberately; do not expose the default unauthenticated API directly.
 
 ## Directory Structure
 
@@ -41,7 +47,7 @@ firecrawl-selfhost/
 ├── .env.example             # Configuration template
 ├── README.md                # This file
 ├── config/
-│   └── opencode.json        # opencode MCP config (copy to ~/.config/opencode/config.json)
+│   └── opencode.json        # MCP snippet (merge into ~/.config/opencode/opencode.json[c])
 ├── research-service/
 │   ├── main.py              # FastAPI research proxy (OpenAlex + arXiv + GitHub)
 │   ├── Dockerfile           # Python 3.12 container
@@ -53,37 +59,43 @@ firecrawl-selfhost/
 
 ## What's Included
 
-### 14 Working Features (all unlimited)
+### Working Features
 
-| # | Feature | Backend | Limits Removed |
+| # | Feature | Backend | Self-hosted bound |
 |---|---------|---------|----------------|
-| 1 | `scrape` (markdown) | Playwright | Rate limit 100k/min, timeout 300s |
-| 2 | `scrape` (JSON extract) | Fireworks AI | Rate limit 100k/min |
-| 3 | `scrape` (query format) | Fireworks AI | Rate limit 100k/min |
-| 4 | `crawl` | Playwright + queue | 50 concurrent, 32 workers, 10000 page limit |
-| 5 | `map` | Playwright | 1M URL limit, 100k/min rate |
-| 6 | `search` | SearXNG | 1000 results, 100k/min rate |
-| 7 | `extract` | Fireworks AI | 100 URLs, 100k/min rate |
-| 8 | `parse` | Firecrawl API | No limit |
-| 9 | `research_search_papers` | OpenAlex | 10,000 results per query |
-| 10 | `research_inspect_paper` | arXiv + OpenAlex | No limit |
-| 11 | `research_read_paper` | arXiv PDF download | All PDF pages, 500 passages |
-| 12 | `research_related_papers` | OpenAlex citations | 10,000 results, 20 seed IDs |
-| 13 | `research_search_github` | GitHub API | 1,000 results |
-| 14 | `developer_search` | GitHub code, issues, and repositories | 100 results |
+| 1 | `scrape` (markdown) | Playwright | 300s request timeout |
+| 2 | `scrape` (JSON extract) | Configured LLM | Provider/model context |
+| 3 | `scrape` (query format) | Configured LLM | Provider/model context |
+| 4 | `crawl` | Playwright + queue | 10,000 pages/request, 50 local concurrency |
+| 5 | `map` | Playwright | 1,000,000 URLs/request |
+| 6 | `search` | SearXNG | 1,000 results/source/request |
+| 7 | `extract` | Configured LLM | 100 URLs/request in v2 |
+| 8 | `parse` | Firecrawl API | 50 MB upload limit |
+| 9 | `research_search_papers` | OpenAlex | 10,000 results/request |
+| 10 | `research_inspect_paper` | arXiv + OpenAlex | One paper/request |
+| 11 | `research_read_paper` | arXiv/PMC PDF download | 500 passages/request |
+| 12 | `research_related_papers` | OpenAlex citations + S2 | 500 results, 20 seed IDs |
+| 13 | `research_search_github` | GitHub API | 1,000 results/request |
+| 14 | `developer_search` | GitHub code, issues, and repositories | 1,000 results/request |
 
 ### Features Requiring Additional Infrastructure
 
 | Feature | Reason |
 |---------|--------|
-| `interact` | Requires Supabase database for stored scrape context |
-| `monitor_*` | Requires database for monitor persistence |
-| `feedback` / `search_feedback` | Requires database |
+| `interact` | Uses the local browser-session adapter layered onto Playwright |
+| `monitor_*` | Uses the local PostgreSQL schema and durable volume |
+| `feedback` / `search_feedback` | Uses the local PostgreSQL schema |
 | Screenshot/actions | Require a Fire Engine endpoint via `FIRE_ENGINE_BETA_URL` |
 
-The local agent patch scrapes supplied URLs (or searches when no URLs are
-provided) and synthesizes the result with the configured LLM using in-memory
-job state.
+The local agent patch scrapes up to 10 supplied URLs (or searches when no URLs
+are provided), caps synthesis input at 400,000 characters, and persists job
+state in PostgreSQL when `DATABASE_URL` is configured. Jobs interrupted by an
+API restart are reported as failed rather than silently remaining “processing”.
+
+The MCP configuration caps every Firecrawl tool result at 400,000 characters
+(roughly 100,000 typical English/Markdown tokens). Oversized results retain
+their beginning and end with a truncation notice, leaving most of a 1M-token
+model context available for the conversation and follow-up analysis.
 
 ## Step-by-Step Installation
 
@@ -104,7 +116,8 @@ This will:
 1. Clone the Firecrawl repository into `./firecrawl/`
 2. Apply all patches (rate limits, timeouts, max performance settings)
 3. Copy the research-service into the Firecrawl apps directory
-4. Create a `.env` file from the template
+4. Create or preserve `.env`, generate local service secrets, and enforce mode `0600`
+5. Pin the source revision to `FIRECRAWL_REF` (override it explicitly when upgrading)
 
 ### Step 3: Edit .env
 
@@ -114,8 +127,11 @@ nano .env
 
 **Required values to change:**
 - `OPENAI_API_KEY` — Your Fireworks AI API key (get one at https://fireworks.ai)
-- `SEARXNG_SECRET` — Any random string
 - `POSTGRES_PASSWORD` — Any random password
+
+`setup.sh` generates `SEARXNG_SECRET`, `BULL_AUTH_KEY`, and
+`BROWSER_SERVICE_API_KEY` when they are missing or still contain a template
+value. Do not commit `.env`.
 
 **Optional but recommended:**
 - `GITHUB_TOKEN` — GitHub personal access token (raises API limit from 60 to 5000 req/hr)
@@ -142,16 +158,18 @@ nano .env
 
 Or manually:
 ```bash
+# Refresh the in-stack DATABASE_URL after changing PostgreSQL credentials.
+./setup.sh
 docker compose build
-docker compose up -d
+docker compose up -d --wait --wait-timeout 300
 ```
 
 Build takes 10-20 minutes. After starting, verify:
 ```bash
-curl http://localhost:3002/
-# Should return HTML
+curl -fsS http://127.0.0.1:${PORT:-3002}/
+# Should return the Firecrawl JSON health response
 
-docker exec firecrawl-api-1 node -e "
+docker compose exec -T api node -e "
   fetch('http://research-service:8000/health')
     .then(r => r.json())
     .then(d => console.log(d))
@@ -161,19 +179,41 @@ docker exec firecrawl-api-1 node -e "
 
 ### Step 5: Configure opencode
 
-1. Copy the config:
+The file is a minimal MCP snippet. Do not overwrite an existing global
+configuration; merge its `mcp.firecrawl` entry into the active file:
+`~/.config/opencode/opencode.json` or `~/.config/opencode/opencode.jsonc`.
+
+```json
+{
+  "mcp": {
+    "firecrawl": {
+      "type": "local",
+      "command": ["npx", "-y", "firecrawl-mcp@3.22.2"],
+      "environment": {
+        "FIRECRAWL_API_URL": "http://localhost:3002",
+        "FIRECRAWL_MCP_MAX_OUTPUT_CHARS": "400000"
+      }
+    }
+  }
+}
+```
+
+After merging:
+
+1. Create the config directory if needed:
 ```bash
-cp config/opencode.json ~/.config/opencode/config.json
+mkdir -p ~/.config/opencode
 ```
 
 2. Restart opencode. It will auto-install `firecrawl-mcp` via npx.
 
-3. Patch the MCP server limits:
+3. Patch the installed MCP bundle and add the developer-search tool:
 ```bash
 ./patch-mcp.sh
 ```
 
-4. Restart opencode again for the MCP patches to take effect.
+4. Restart opencode again. Verify configuration with `opencode debug config`
+   and `opencode mcp list`.
 
 ### Step 6: Verify everything works
 
@@ -211,24 +251,30 @@ The defaults are tuned for a **64-core / 512GB RAM** machine. Adjust in `.env`:
 ### Smaller machines (8 cores / 16GB RAM)
 ```env
 NUM_WORKERS_PER_QUEUE=8
+NUQ_WORKER_COUNT=8
 CRAWL_CONCURRENT_REQUESTS=10
 MAX_CONCURRENT_JOBS=10
+SELF_HOSTED_CONCURRENCY_LIMIT=10
 BROWSER_POOL_SIZE=5
 ```
 
 ### Medium machines (16 cores / 64GB RAM)
 ```env
 NUM_WORKERS_PER_QUEUE=16
+NUQ_WORKER_COUNT=16
 CRAWL_CONCURRENT_REQUESTS=20
 MAX_CONCURRENT_JOBS=20
+SELF_HOSTED_CONCURRENCY_LIMIT=20
 BROWSER_POOL_SIZE=10
 ```
 
 ### Large machines (32+ cores / 128GB+ RAM)
 ```env
 NUM_WORKERS_PER_QUEUE=32
+NUQ_WORKER_COUNT=32
 CRAWL_CONCURRENT_REQUESTS=50
 MAX_CONCURRENT_JOBS=50
+SELF_HOSTED_CONCURRENCY_LIMIT=50
 BROWSER_POOL_SIZE=20
 ```
 
@@ -268,7 +314,9 @@ This is implemented via `getModel()` (uses `MODEL_NAME`) and `getModelFast()` (u
 
 ### Research Service
 
-Firecrawl's research endpoints (`/v2/search/research/papers`, etc.) are a **proxy** — they forward requests to `RESEARCH_PROXY_URL`. Without that URL set, the routes aren't even registered (404).
+Firecrawl's research endpoints (`/v2/search/research/papers`, etc.) are a
+**proxy** — they forward requests to `RESEARCH_PROXY_URL`. This package sets
+that URL to the in-stack research service by default.
 
 This package includes a custom FastAPI service (`research-service/`) that implements all 5 research endpoints:
 
@@ -279,22 +327,28 @@ This package includes a custom FastAPI service (`research-service/`) that implem
 | `/v2/research/papers/:id` (with `query=`) | arXiv PDF download | Extract relevant passages from full text |
 | `/v2/research/papers/:id/similar` | OpenAlex citation graph | Find related papers |
 | `/v2/research/github` | GitHub Search API | Search repos, issues, and PRs |
+| `/v2/search/developer` | GitHub code/history APIs | Search code, docs, READMEs, issues, and PRs |
 
 ### SearXNG
 
-Firecrawl's `/search` endpoint uses DuckDuckGo by default, which gets IP-banned after a few searches. SearXNG is a self-hosted meta-search engine that aggregates results from Google, Bing, DuckDuckGo, and Wikipedia — no rate limits, no bans.
+Firecrawl's `/search` endpoint uses SearXNG first. SearXNG aggregates Google,
+Bing, DuckDuckGo, Wikipedia, and category-specific news/image engines. It
+reduces direct-provider bans but cannot remove upstream provider rate limits;
+DuckDuckGo is retained only as a type-safe web fallback.
 
 ### Patches Applied
 
 The `patch-firecrawl.sh` script modifies these Firecrawl source files:
 
-1. **`rate-limiter.ts`** — All rate limits set to 100,000/min (effectively unlimited)
+1. **`rate-limiter.ts`** — Preserve upstream multiplier/override semantics; self-host auth bypasses hosted rate limiting
 2. **`config.ts`** — `MAX_CPU` and `MAX_RAM` set to 0.99; worker lock duration 300s; stalled check 120s
 3. **`types.ts`** — Search limit 1000; extract URLs 100; map limit 1M; `waitFor` 300s; search timeout 300s
 4. **`research-proxy.ts`** — Proxy timeout 600s
-5. **`docker-compose.yaml`** — 32 workers, 50 concurrent, 20 browser pool, increased memory
-6. **MCP server** (`index.js`) — k.max limits increased to 10000/500/1000
+5. **`docker-compose.yaml`** — 32 NuQ workers, 50 local concurrency, durable services, health gates, and local schema bootstrap
+6. **MCP server** (`index.js`) — validated k.max limits, a 400k-character result cap, and a developer-search bridge when the package lacks it
 7. **JS SDK** (`index.js`) — HTTP timeout 600s
+8. **Playwright service** — local browser-session compatibility adapter for `browser`/`interact`
+9. **Research service** — canonical IDs, filters, scored passages, citation modes, and GitHub code search
 
 ## Troubleshooting
 
@@ -308,7 +362,7 @@ docker compose logs searxng --tail 50
 ### Search returns empty results
 Check SearXNG is running and accessible:
 ```bash
-docker exec firecrawl-api-1 node -e "
+docker compose exec -T api node -e "
   fetch('http://searxng:8080/search?q=test&format=json')
     .then(r => r.json())
     .then(d => console.log('Results:', d.results?.length))
@@ -325,32 +379,57 @@ If 0 results, SearXNG engines may be blocked. Edit `searxng/settings.yml` to add
 ### Research endpoints return 404
 - Verify `RESEARCH_PROXY_URL` is set in `.env`: `http://research-service:8000`
 - Check the research service is running: `docker compose logs research-service`
-- Check the API can reach it: `docker exec firecrawl-api-1 node -e "fetch('http://research-service:8000/health').then(r=>r.text()).then(console.log)"`
+- Check the API can reach it: `docker compose exec -T api node -e "fetch('http://research-service:8000/health').then(r=>r.text()).then(console.log)"`
 
 ### Research: arXiv papers return 404
 - The arXiv API uses HTTPS. The service is configured for `https://export.arxiv.org/api`
 - If arXiv is down, try using DOI-based lookups instead
 
 ### MCP tools not appearing in opencode
-1. Verify config: `cat ~/.config/opencode/config.json`
+1. Verify config: `opencode debug config`
 2. Restart opencode
-3. Run `./patch-mcp.sh` to patch the MCP server limits
+3. Run `./patch-mcp.sh` to patch the MCP server limits and developer search
 4. Restart opencode again
 
-### DuckDuckGo anti-bot errors in logs
-This is expected — SearXNG handles search now. DuckDuckGo errors are only in the fallback path. If SearXNG returns results, DuckDuckGo is never called.
+### Database or interact state is missing
+Run the idempotent schema repair against the running stack:
+```bash
+./init-db.sh
+```
+It honors a custom `DATABASE_URL`, creates the local persistence indexes, and
+fails nonzero if any required DDL cannot be applied.
+
+### Browser view links
+The local adapter supports `agent-browser` commands only. Its view URLs are
+safe HTML snapshots, not a remote live-streaming UI. Use `stdout` and `result`
+for automation; configure a dedicated browser service if a real live view or
+arbitrary Node execution is required.
+
+### DuckDuckGo or upstream anti-bot errors
+SearXNG is tried first and ordinary web search may fall back to DuckDuckGo.
+Provider-level throttling and CAPTCHA responses are still possible; tune the
+engine list in `searxng/settings.yml`.
 
 ## Updating
 
 To update Firecrawl to a newer version:
 ```bash
-cd firecrawl
-git pull
-cd ..
-./patch-firecrawl.sh ./firecrawl
+FIRECRAWL_REF=<tested-commit> ./setup.sh
 docker compose build
-docker compose up -d --force-recreate
+docker compose up -d --wait --wait-timeout 300
+./init-db.sh
 ```
+Back up PostgreSQL before an upstream update. The Firecrawl checkout is
+patched in place, so do not `git pull` over local changes; use a fresh clone or
+set `FIRECRAWL_REF` and re-run setup. The PostgreSQL, Redis, and RabbitMQ
+named volumes survive container recreation.
+
+### Backups
+```bash
+docker compose exec -T nuq-postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"' > firecrawl-backup.sql
+```
+Restore into a stopped disposable stack first, then run `./init-db.sh` to apply
+any schema additions.
 
 ## License
 

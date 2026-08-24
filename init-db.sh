@@ -13,28 +13,19 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ ! -f "$DIR/.env" ]; then
-  echo ".env not found — copy env.example and set POSTGRES_PASSWORD first."
+  echo ".env not found - run ./setup.sh and set POSTGRES_PASSWORD first."
   exit 1
 fi
 
-DB_USER=$(grep '^POSTGRES_USER=' "$DIR/.env" | cut -d= -f2-)
-DB_PASSWORD=$(grep '^POSTGRES_PASSWORD=' "$DIR/.env" | cut -d= -f2-)
-DB_NAME=$(grep '^POSTGRES_DB=' "$DIR/.env" | cut -d= -f2-)
-[ -n "$DB_USER" ] || { echo "POSTGRES_USER missing from .env"; exit 1; }
-[ -n "$DB_PASSWORD" ] || { echo "POSTGRES_PASSWORD missing from .env"; exit 1; }
-[ -n "$DB_NAME" ] || { echo "POSTGRES_DB missing from .env"; exit 1; }
+if ! docker compose -f "$DIR/docker-compose.yaml" config -q; then
+  echo "Compose configuration is invalid; fix .env before initializing the database."
+  exit 1
+fi
 
-urlencode() {
-  python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
-}
-
-DBURL="postgres://$(urlencode "$DB_USER"):$(urlencode "$DB_PASSWORD")@nuq-postgres:5432/$(urlencode "$DB_NAME")"
-
-API_CONTAINER=$(docker compose -f "$DIR/docker-compose.yaml" ps -q api)
-[ -n "$API_CONTAINER" ] || { echo "Firecrawl api container is not running."; exit 1; }
-
-docker cp "$DIR/db-init.js" "$API_CONTAINER:/tmp/db-init.js"
-docker exec -e DATABASE_URL="$DBURL" "$API_CONTAINER" node /tmp/db-init.js
+# The db-init service receives DATABASE_URL from the same resolved Compose
+# environment as the API. This honors custom/remote URLs and avoids parsing
+# passwords in shell or process arguments.
+docker compose -f "$DIR/docker-compose.yaml" run --rm db-init
 
 echo ""
 echo "Local Postgres schema ready. Monitors, feedback and request telemetry"

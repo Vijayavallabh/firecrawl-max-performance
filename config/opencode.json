@@ -3,9 +3,10 @@
   "mcp": {
     "firecrawl": {
       "type": "local",
-      "command": ["npx", "-y", "firecrawl-mcp"],
+      "command": ["npx", "-y", "firecrawl-mcp@3.22.2"],
       "environment": {
-        "FIRECRAWL_API_URL": "http://localhost:3002"
+        "FIRECRAWL_API_URL": "http://localhost:3002",
+        "FIRECRAWL_MCP_MAX_OUTPUT_CHARS": "400000"
       }
     }
   }

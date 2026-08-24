@@ -29,33 +29,39 @@ x-common-env: &common-env
   REDIS_RATE_LIMIT_URL: ${REDIS_URL:-redis://redis:6379}
   PLAYWRIGHT_MICROSERVICE_URL: ${PLAYWRIGHT_MICROSERVICE_URL:-http://playwright-service:3000/scrape}
   POSTGRES_USER: ${POSTGRES_USER:-firecrawl}
-  POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-firecrawl}"
+  POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}"
   POSTGRES_DB: ${POSTGRES_DB:-postgres}
   POSTGRES_HOST: ${POSTGRES_HOST:-nuq-postgres}
   POSTGRES_PORT: ${POSTGRES_PORT:-5432}
   USE_DB_AUTHENTICATION: ${USE_DB_AUTHENTICATION:-false}
   DATABASE_URL: ${DATABASE_URL:-}
+  DB_POOL_MAX: ${DB_POOL_MAX:-8}
 
   # --- Performance tuning (maxed out) ---
   NUM_WORKERS_PER_QUEUE: ${NUM_WORKERS_PER_QUEUE:-32}
+  NUQ_WORKER_COUNT: ${NUQ_WORKER_COUNT:-32}
   CRAWL_CONCURRENT_REQUESTS: ${CRAWL_CONCURRENT_REQUESTS:-50}
   MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-50}
+  SELF_HOSTED_CONCURRENCY_LIMIT: ${SELF_HOSTED_CONCURRENCY_LIMIT:-50}
   BROWSER_POOL_SIZE: ${BROWSER_POOL_SIZE:-20}
 
-  MODEL_EMBEDDING_NAME: ${MODEL_EMBEDDING_NAME}
-  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
-  AUTUMN_SECRET_KEY: ${AUTUMN_SECRET_KEY}
-  SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
-  BULL_AUTH_KEY: ${BULL_AUTH_KEY}
-  TEST_API_KEY: ${TEST_API_KEY}
-  SUPABASE_ANON_TOKEN: ${SUPABASE_ANON_TOKEN}
-  SUPABASE_URL: ${SUPABASE_URL}
-  SUPABASE_SERVICE_TOKEN: ${SUPABASE_SERVICE_TOKEN}
-  SELF_HOSTED_WEBHOOK_URL: ${SELF_HOSTED_WEBHOOK_URL}
+  MODEL_EMBEDDING_NAME: ${MODEL_EMBEDDING_NAME:-}
+  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+  AUTUMN_SECRET_KEY: ${AUTUMN_SECRET_KEY:-}
+  SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+  BULL_AUTH_KEY: ${BULL_AUTH_KEY:?Run setup.sh to generate BULL_AUTH_KEY}
+  TEST_API_KEY: ${TEST_API_KEY:-}
+  SUPABASE_ANON_TOKEN: ${SUPABASE_ANON_TOKEN:-}
+  SUPABASE_URL: ${SUPABASE_URL:-}
+  SUPABASE_SERVICE_TOKEN: ${SUPABASE_SERVICE_TOKEN:-}
+  SELF_HOSTED_WEBHOOK_URL: ${SELF_HOSTED_WEBHOOK_URL:-}
+  BROWSER_SERVICE_URL: ${BROWSER_SERVICE_URL:-http://playwright-service:3000}
+  BROWSER_SERVICE_API_KEY: ${BROWSER_SERVICE_API_KEY:?Run setup.sh to generate BROWSER_SERVICE_API_KEY}
+  BROWSER_SERVICE_WEBHOOK_SECRET: ${BROWSER_SERVICE_WEBHOOK_SECRET:-}
   LOGGING_LEVEL: ${LOGGING_LEVEL:-info}
-  PROXY_SERVER: ${PROXY_SERVER}
-  PROXY_USERNAME: ${PROXY_USERNAME}
-  PROXY_PASSWORD: ${PROXY_PASSWORD}
+  PROXY_SERVER: ${PROXY_SERVER:-}
+  PROXY_USERNAME: ${PROXY_USERNAME:-}
+  PROXY_PASSWORD: ${PROXY_PASSWORD:-}
 
   # --- SearXNG search backend ---
   SEARXNG_ENDPOINT: ${SEARXNG_ENDPOINT:-http://searxng:8080}
@@ -66,8 +72,8 @@ x-common-env: &common-env
   RESEARCH_PROXY_URL: ${RESEARCH_PROXY_URL:-http://research-service:8000}
 
   # Set NUQ_BACKEND=fdb to run the queue on FoundationDB instead of Postgres
-  NUQ_BACKEND: ${NUQ_BACKEND}
-  FDB_CLUSTER_FILE: ${NUQ_BACKEND:+/var/fdb/fdb.cluster}
+  NUQ_BACKEND: ${NUQ_BACKEND:-}
+  FDB_CLUSTER_FILE: ${FDB_CLUSTER_FILE:-}
 
 services:
   playwright-service:
@@ -75,12 +81,14 @@ services:
     build: ./firecrawl/apps/playwright-service-ts
     environment:
       PORT: 3000
-      PROXY_SERVER: ${PROXY_SERVER}
-      PROXY_USERNAME: ${PROXY_USERNAME}
-      PROXY_PASSWORD: ${PROXY_PASSWORD}
-      ALLOW_LOCAL_WEBHOOKS: ${ALLOW_LOCAL_WEBHOOKS}
-      BLOCK_MEDIA: ${BLOCK_MEDIA}
+      PROXY_SERVER: ${PROXY_SERVER:-}
+      PROXY_USERNAME: ${PROXY_USERNAME:-}
+      PROXY_PASSWORD: ${PROXY_PASSWORD:-}
+      ALLOW_LOCAL_WEBHOOKS: ${ALLOW_LOCAL_WEBHOOKS:-}
+      BLOCK_MEDIA: ${BLOCK_MEDIA:-}
       MAX_CONCURRENT_PAGES: ${CRAWL_CONCURRENT_REQUESTS:-50}
+      BROWSER_SERVICE_API_KEY: ${BROWSER_SERVICE_API_KEY:?Run setup.sh to generate BROWSER_SERVICE_API_KEY}
+      BROWSER_SERVICE_PUBLIC_URL: ${BROWSER_SERVICE_PUBLIC_URL:-http://playwright-service:3000}
     networks:
       - backend
     mem_limit: 32G
@@ -93,6 +101,12 @@ services:
         compress: "true"
     tmpfs:
       - /tmp/.cache:noexec,nosuid,size=4g
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
 
   api:
     restart: unless-stopped
@@ -112,25 +126,48 @@ services:
       ENV: local
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
       playwright-service:
-        condition: service_started
+        condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      nuq-postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+      research-service:
+        condition: service_healthy
+      searxng:
+        condition: service_healthy
+      foundationdb-init:
+        condition: service_completed_successfully
     ports:
-      - "${PORT:-3002}:${INTERNAL_PORT:-3002}"
+      - "${HOST_BIND_ADDRESS:-127.0.0.1}:${PORT:-3002}:${INTERNAL_PORT:-3002}"
     volumes:
       - fdb-cluster-file:/var/fdb:ro
     command: node dist/src/harness.js --start-docker
     mem_limit: 64G
     memswap_limit: 64G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:$${PORT}/ >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
 
   redis:
     restart: unless-stopped
-    image: redis:alpine
+    image: redis@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
     networks:
       - backend
-    command: redis-server --bind 0.0.0.0
+    command: redis-server --bind 0.0.0.0 --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
     logging:
       driver: "json-file"
       options:
@@ -140,10 +177,12 @@ services:
 
   rabbitmq:
     restart: unless-stopped
-    image: rabbitmq:3-management
+    image: rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69
     networks:
       - backend
     command: rabbitmq-server
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
       interval: 5s
@@ -162,10 +201,18 @@ services:
     build: ./firecrawl/apps/nuq-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-firecrawl}
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-firecrawl}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}"
       POSTGRES_DB: ${POSTGRES_DB:-postgres}
     networks:
       - backend
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
     logging:
       driver: "json-file"
       options:
@@ -198,7 +245,7 @@ services:
     entrypoint:
       - /bin/bash
       - -c
-      - "sleep 5 && out=$(fdbcli -C /var/fdb/fdb.cluster --exec 'configure new single ssd' 2>&1); status=$$?; printf '%s\n' \"$$out\"; if [ \"$$status\" -eq 0 ]; then exit 0; fi; printf '%s\n' \"$$out\" | grep -Eiq 'already.*configured|database.*configured'"
+      - "for attempt in $$(seq 1 60); do out=$$(fdbcli -C /var/fdb/fdb.cluster --exec 'configure new single ssd' 2>&1); status=$$?; printf '%s\n' \"$$out\"; if [ \"$$status\" -eq 0 ] || printf '%s\n' \"$$out\" | grep -Eiq 'already.*configured|database.*configured|database already exists'; then exit 0; fi; sleep 2; done; exit 1"
     volumes:
       - fdb-cluster-file:/var/fdb
     networks:
@@ -211,10 +258,10 @@ services:
   # ==================================================================
   searxng:
     restart: unless-stopped
-    image: searxng/searxng:latest
+    image: searxng/searxng@sha256:11a9b34cdc0b1ec2b991470a2762ecb5a1a531898289fb51dcd015260450729e
     environment:
       - SEARXNG_BASE_URL=http://searxng:8080
-      - SEARXNG_SECRET=${SEARXNG_SECRET:-firecrawl-secret-key}
+      - SEARXNG_SECRET=${SEARXNG_SECRET:?Run setup.sh to generate SEARXNG_SECRET}
     networks:
       - backend
     volumes:
@@ -225,6 +272,29 @@ services:
         max-size: "5m"
         max-file: "2"
         compress: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # Applies the public Drizzle schema plus local-only persistence indexes before
+  # the API starts. It is safe to run again after an upstream source update.
+  db-init:
+    restart: "no"
+    <<: *common-service
+    env_file:
+      - .env
+    environment:
+      <<: *common-env
+      ENV: local
+    depends_on:
+      nuq-postgres:
+        condition: service_healthy
+    volumes:
+      - ./db-init.js:/tmp/db-init.js:ro
+    command: ["node", "/tmp/db-init.js"]
 
   # ==================================================================
   # Research Service — custom FastAPI proxy for 5 research endpoints
@@ -238,8 +308,8 @@ services:
     restart: unless-stopped
     build: ./research-service
     environment:
-      S2_API_KEY: ${S2_API_KEY}
-      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      S2_API_KEY: ${S2_API_KEY:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       MAILTO: ${MAILTO:-research@firecrawl.local}
     networks:
       - backend
@@ -251,11 +321,20 @@ services:
         max-size: "5m"
         max-file: "2"
         compress: "true"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
 networks:
   backend:
     driver: bridge
 
 volumes:
+  pg-data:
+  redis-data:
+  rabbitmq-data:
   fdb-data:
   fdb-cluster-file:

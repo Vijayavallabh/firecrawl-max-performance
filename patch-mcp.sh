@@ -1,58 +1,41 @@
 #!/usr/bin/env bash
 # ======================================================================
-# patch-mcp.sh — Patches the firecrawl-mcp npm package to remove
-# parameter limits (k.max) and increase HTTP timeout.
+# patch-mcp.sh - Patch the installed firecrawl-mcp bundle and SDK.
 #
-# Run this AFTER installing firecrawl-mcp (e.g. via opencode or npx).
+# The bundle is generated code and has changed its zod variable name across
+# releases. patch-mcp.js validates each replacement and adds the developer
+# search tool when the published MCP package does not expose it yet.
 # ======================================================================
 set -euo pipefail
 
-echo "Finding firecrawl-mcp installation..."
-MCP_JS=$(find "$HOME/.npm" -path "*/firecrawl-mcp/dist/index.js" 2>/dev/null | head -1 || true)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+command -v node >/dev/null 2>&1 || {
+  echo "Error: node is required to patch firecrawl-mcp."
+  exit 1
+}
+
+MCP_JS=""
+for cache_root in "${HOME:-/home}/.npm" "${HOME:-/home}/.cache" "${HOME:-/home}/.local" /usr/local/lib/node_modules; do
+  if [ -d "$cache_root" ]; then
+    MCP_JS=$(find "$cache_root" -path "*/firecrawl-mcp/dist/index.js" -print -quit 2>/dev/null || true)
+  fi
+  [ -n "$MCP_JS" ] && break
+done
 
 if [ -z "$MCP_JS" ]; then
-  echo "firecrawl-mcp not found in ~/.npm."
-  echo "Install it first with: npx -y firecrawl-mcp"
-  echo "Or restart opencode (it auto-installs MCP servers)."
+  echo "firecrawl-mcp not found in the npm cache."
+  echo "Install it first with: npx -y firecrawl-mcp@3.22.2"
   exit 1
 fi
 
-echo "Found: $MCP_JS"
-echo "Patching..."
+SDK_JS=""
+for cache_root in "${HOME:-/home}/.npm" "${HOME:-/home}/.cache" "${HOME:-/home}/.local" /usr/local/lib/node_modules; do
+  if [ -d "$cache_root" ]; then
+    SDK_JS=$(find "$cache_root" -path "*/@mendable/firecrawl-js/dist/index.js" -print -quit 2>/dev/null || true)
+  fi
+  [ -n "$SDK_JS" ] && break
+done
 
-# search_papers k.max: 500 -> 10000
-sed -i 's/k: z2.number().int().min(1).max(500).optional().describe("Number of ranked papers to return (default 40).")/k: z2.number().int().min(1).max(10000).optional().describe("Number of ranked papers to return (default 40).")/' "$MCP_JS"
-
-# related_papers seed_ids.max: 10 -> 20
-sed -i 's/seed_ids: z2.array(z2.string()).min(1).max(10)/seed_ids: z2.array(z2.string()).min(1).max(20)/' "$MCP_JS"
-
-# read_paper k.max: 50 -> 500
-sed -i 's/k: z2.number().int().min(1).max(50).optional().describe("Number of passages to return (default 4).")/k: z2.number().int().min(1).max(500).optional().describe("Number of passages to return (default 4).")/' "$MCP_JS"
-
-# search_github k.max: 100 -> 1000
-sed -i 's/k: z2.number().int().min(1).max(100).optional()/k: z2.number().int().min(1).max(1000).optional()/' "$MCP_JS"
-
-# Remove character/token truncation of tool results:
-sed -i 's/var MAX_AUTHORS = 15;/var MAX_AUTHORS = 500;/' "$MCP_JS"
-sed -i 's/var MAX_ABSTRACT_CHARS = 600;/var MAX_ABSTRACT_CHARS = 200000;/' "$MCP_JS"
-sed -i 's/var MAX_AFFIL_CHARS = 60;/var MAX_AFFIL_CHARS = 4000;/' "$MCP_JS"
-sed -i 's/var MAX_AUTHORS_LINE_CHARS = 400;/var MAX_AUTHORS_LINE_CHARS = 40000;/' "$MCP_JS"
-sed -i 's/var MAX_GITHUB_CONTENT_CHARS = 1200;/var MAX_GITHUB_CONTENT_CHARS = 500000;/' "$MCP_JS"
-
-# JS SDK HTTP timeout: 300s -> 600s
-SDK_JS=$(dirname "$(dirname "$MCP_JS")")/@mendable/firecrawl-js/dist/index.js 2>/dev/null || true
-if [ -f "$SDK_JS" ]; then
-  sed -i 's/timeout: options.timeoutMs ?? 3e5/timeout: options.timeoutMs ?? 6e5/' "$SDK_JS"
-  echo "Patched JS SDK timeout: $SDK_JS"
-fi
-
-echo ""
-echo "Done! MCP server patched with:"
-echo "  - search_papers k.max: 500 -> 10000"
-echo "  - related_papers seed_ids.max: 10 -> 20"
-echo "  - read_paper k.max: 50 -> 500"
-echo "  - search_github k.max: 100 -> 1000"
-echo "  - abstract/authors/github content char caps: removed (200k/40k/500k)"
-echo "  - HTTP timeout: 300s -> 600s"
-echo ""
-echo "Restart opencode for changes to take effect."
+node "$SCRIPT_DIR/patch-mcp.js" "$MCP_JS" "$SDK_JS"
+echo "Restart opencode for the patched tool schemas to take effect."

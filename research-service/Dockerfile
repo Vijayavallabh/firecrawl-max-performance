@@ -5,7 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+COPY main.py test_main.py ./
+
+RUN python -m unittest test_main
 
 EXPOSE 8000
 

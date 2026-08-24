@@ -1,7 +1,8 @@
 use_default_settings: true
 
 server:
-  secret_key: "CHANGE_ME_TO_A_RANDOM_STRING"
+  # The official image replaces this placeholder with SEARXNG_SECRET at startup.
+  secret_key: "ultrasecretkey"
   image_proxy: true
   limiter: false
   public_instance: false
@@ -35,11 +36,11 @@ engines:
   - name: google news
     engine: google_news
     shortcut: gnews
-    disabled: true
+    disabled: false
   - name: bing news
     engine: bing_news
     shortcut: bnews
-    disabled: true
+    disabled: false
   - name: google images
     engine: google_images
     shortcut: goimg
