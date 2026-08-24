@@ -340,6 +340,15 @@ async function executeBash(session: Session, code: string): Promise<string> {
   return output;
 }
 
+async function executeNode(session: Session, code: string): Promise<string> {
+  const run = new Function(
+    "page",
+    "context",
+    `return (async () => {\n${code}\n})();`,
+  ) as (page: Page, context: BrowserContext) => Promise<unknown>;
+  return outputText(await run(session.page, session.context));
+}
+
 export function installBrowserSessionRoutes(
   app: Express,
   deps: AdapterDependencies,
@@ -425,7 +434,9 @@ export function installBrowserSessionRoutes(
     try {
       const execution = language === "bash"
         ? executeBash(session, code)
-        : Promise.reject(new Error("The local adapter supports agent-browser bash commands only"));
+        : language === "node"
+          ? executeNode(session, code)
+          : Promise.reject(new Error(`Unsupported execution language: ${language}`));
       const timed = new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error("Browser execution timed out")), timeout);
       });

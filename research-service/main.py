@@ -6,6 +6,7 @@ import io
 import os
 import asyncio
 import base64
+import time
 from difflib import SequenceMatcher
 import xml.etree.ElementTree as ET
 from urllib.parse import quote, unquote, urlparse
@@ -26,7 +27,25 @@ S2_API_KEY = os.environ.get("S2_API_KEY", "")
 
 TIMEOUT = 300.0
 
+
+def bounded_env_number(name: str, default: float, minimum: float, maximum: float, cast):
+    try:
+        value = cast(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+PAPER_SEARCH_MAX_PAGES = bounded_env_number("PAPER_SEARCH_MAX_PAGES", 10, 1, 50, int)
+PAPER_SEARCH_SCAN_TIMEOUT_SECONDS = bounded_env_number(
+    "PAPER_SEARCH_SCAN_TIMEOUT_SECONDS", 90.0, 1.0, 300.0, float
+)
+
 BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+ARXIV_STOP_WORDS = {
+    "a", "an", "and", "as", "at", "benchmark", "for", "in", "is", "large",
+    "model", "models", "of", "on", "the", "to", "use", "with",
+}
 
 ARXIV_ID_RE = re.compile(
     r"^(?:\d{4}\.\d{4,5}(?:v\d+)?|[a-z][a-z0-9.-]+/\d{7}(?:v\d+)?)$",
@@ -36,6 +55,24 @@ ARXIV_ID_RE = re.compile(
 
 def normalize_title(value: Optional[str]) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+def normalize_developer_types(values: Optional[List[str]]) -> set[str]:
+    aliases = {
+        "docs": "doc",
+        "issues": "issue",
+        "pr": "pull_request",
+        "prs": "pull_request",
+        "pull_requests": "pull_request",
+        "repo": "readme",
+        "repos": "readme",
+        "repo_readme": "readme",
+    }
+    return {
+        aliases.get(value.strip().lower(), value.strip().lower())
+        for value in (values or [])
+        if value.strip()
+    }
 
 
 def parse_paper_reference(value: str) -> dict:
@@ -220,9 +257,95 @@ def get_arxiv_id_from_ids(ids: dict) -> Optional[str]:
 
 ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
 
+
+def arxiv_entry_to_result(entry: ET.Element) -> dict:
+    entry_id = entry.findtext("atom:id", default="", namespaces=ARXIV_NS)
+    arxiv_id = entry_id.rsplit("/", 1)[-1]
+    title = entry.find("atom:title", ARXIV_NS)
+    summary = entry.find("atom:summary", ARXIV_NS)
+    published = entry.find("atom:published", ARXIV_NS)
+    updated = entry.find("atom:updated", ARXIV_NS)
+    authors = []
+    for author in entry.findall("atom:author", ARXIV_NS):
+        name = author.find("atom:name", ARXIV_NS)
+        if name is not None:
+            authors.append({"name": name.text.strip()})
+    categories = [
+        category.get("term")
+        for category in entry.findall("atom:category", ARXIV_NS)
+        if category.get("term")
+    ]
+    doi_el = entry.find("arxiv:doi", ARXIV_NS)
+    ids = {"arxiv": [arxiv_id]}
+    if doi_el is not None and doi_el.text:
+        ids["doi"] = [doi_el.text.strip()]
+    return {
+        "paperId": f"arxiv:{arxiv_id}",
+        "primaryId": f"arxiv:{arxiv_id}",
+        "title": re.sub(r"\s+", " ", title.text.strip()) if title is not None and title.text else "",
+        "authors": ", ".join(author["name"] for author in authors),
+        "authorDetails": authors,
+        "abstract": re.sub(r"\s+", " ", summary.text.strip()) if summary is not None and summary.text else "",
+        "categories": categories,
+        "createdDate": published.text[:10] if published is not None and published.text else None,
+        "updateDate": updated.text[:10] if updated is not None and updated.text else None,
+        "ids": ids,
+        "openAlexId": None,
+        "score": 0,
+    }
+
+
+async def arxiv_search(query: str, limit: int, timeout: Optional[float] = None) -> list[dict]:
+    terms = list(dict.fromkeys(
+        term.lower()
+        for term in re.findall(r"[A-Za-z0-9-]+", query)
+        if len(term) > 2 and term.lower() not in ARXIV_STOP_WORDS
+    ))
+    if not terms or (timeout is not None and timeout <= 0):
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, headers={"User-Agent": BROWSER_UA}) as client:
+            resp = await client.get(
+                f"{ARXIV_BASE}/query",
+                params={
+                    # A strict conjunction makes fallback searches for natural-language
+                    # questions almost always empty. Retrieve a bounded broad set and
+                    # rank it locally by the user's meaningful query terms instead.
+                    "search_query": " OR ".join(f"all:{term}" for term in terms[:8]),
+                    "start": 0,
+                    "max_results": min(max(limit * 10, 25), 100),
+                    "sortBy": "relevance",
+                    "sortOrder": "descending",
+                },
+                timeout=min(TIMEOUT, timeout) if timeout is not None else TIMEOUT,
+            )
+        if resp.status_code != 200:
+            return []
+        root = ET.fromstring(resp.text)
+        results = [arxiv_entry_to_result(entry) for entry in root.findall("atom:entry", ARXIV_NS)]
+        query_terms = set(terms)
+        results.sort(
+            key=lambda result: (
+                -len(
+                    query_terms
+                    & set(
+                        re.findall(
+                            r"[a-z0-9-]+",
+                            " ".join((result["title"], result["abstract"])).lower(),
+                        )
+                    )
+                ),
+                result["title"],
+            )
+        )
+        return results[:limit]
+    except (httpx.HTTPError, ET.ParseError):
+        return []
+
+
 async def arxiv_lookup(arxiv_id: str) -> Optional[dict]:
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=TIMEOUT, headers={"User-Agent": BROWSER_UA}) as client:
             resp = await client.get(f"{ARXIV_BASE}/query", params={"id_list": arxiv_id, "max_results": 1})
         if resp.status_code != 200:
             return None
@@ -230,44 +353,7 @@ async def arxiv_lookup(arxiv_id: str) -> Optional[dict]:
         entries = root.findall("atom:entry", ARXIV_NS)
         if not entries:
             return None
-        entry = entries[0]
-        title = entry.find("atom:title", ARXIV_NS)
-        summary = entry.find("atom:summary", ARXIV_NS)
-        published = entry.find("atom:published", ARXIV_NS)
-        updated = entry.find("atom:updated", ARXIV_NS)
-        authors = []
-        for author in entry.findall("atom:author", ARXIV_NS):
-            name = author.find("atom:name", ARXIV_NS)
-            if name is not None:
-                authors.append({"name": name.text.strip()})
-        categories = []
-        for cat in entry.findall("atom:category", ARXIV_NS):
-            term = cat.get("term")
-            if term:
-                categories.append(term)
-        title_text = re.sub(r"\s+", " ", title.text.strip()) if title is not None else None
-        abstract_text = re.sub(r"\s+", " ", summary.text.strip()) if summary is not None else None
-        pub_date = published.text[:10] if published is not None else None
-        up_date = updated.text[:10] if updated is not None else None
-        doi_el = entry.find("arxiv:doi", ARXIV_NS)
-        doi_val = doi_el.text.strip() if doi_el is not None else None
-        ids = {"arxiv": [arxiv_id]}
-        if doi_val:
-            ids["doi"] = [doi_val]
-        return {
-            "paperId": f"arxiv:{arxiv_id}",
-            "primaryId": f"arxiv:{arxiv_id}",
-            "title": title_text or "",
-            "authors": ", ".join(a["name"] for a in authors if a.get("name")),
-            "authorDetails": authors,
-            "abstract": abstract_text or "",
-            "categories": categories,
-            "createdDate": pub_date,
-            "updateDate": up_date,
-            "ids": ids,
-            "openAlexId": None,
-            "score": 0,
-        }
+        return arxiv_entry_to_result(entries[0])
     except Exception as e:
         print(f"arXiv lookup error: {e}")
         return None
@@ -596,6 +682,8 @@ async def search_papers(
     if filters:
         params["filter"] = ",".join(filters)
 
+    can_use_arxiv_fallback = not filters and not authors and not categories
+
     def matches(result: dict) -> bool:
         if authors:
             author_value = result.get("authors", "")
@@ -611,34 +699,99 @@ async def search_papers(
     results = []
     raw_total = 0
     page = 1
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        while len(results) < limit and page <= 50:
-            p = dict(params)
-            p["page"] = page
-            resp = await client.get(f"{OPENALEX_BASE}/works", params=p)
-            if resp.status_code != 200:
-                break
-            data = resp.json()
-            raw_total = data.get("meta", {}).get("count", raw_total)
-            page_results = data.get("results", [])
-            if not page_results:
-                break
-            for work in page_results:
-                result = oa_to_result(work)
-                if matches(result):
-                    results.append(result)
-                    if len(results) >= limit:
-                        break
-            if len(page_results) < 200 or page * 200 >= raw_total:
-                break
-            page += 1
+    scan_started = time.monotonic()
+    scan_deadline = scan_started + PAPER_SEARCH_SCAN_TIMEOUT_SECONDS
+    scan_truncated = False
+
+    async def fetch_openalex_page(client: httpx.AsyncClient, page_params: dict) -> Optional[httpx.Response]:
+        for attempt in range(3):
+            remaining = scan_deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                resp = await client.get(
+                    f"{OPENALEX_BASE}/works",
+                    params=page_params,
+                    timeout=min(TIMEOUT, remaining),
+                )
+            except httpx.HTTPError:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(min(0.5 * (2 ** attempt), max(scan_deadline - time.monotonic(), 0)))
+                continue
+            if resp.status_code not in (429, 502, 503, 504) or attempt == 2:
+                return resp
+            await asyncio.sleep(min(0.5 * (2 ** attempt), max(scan_deadline - time.monotonic(), 0)))
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            while len(results) < limit:
+                if page > PAPER_SEARCH_MAX_PAGES or time.monotonic() >= scan_deadline:
+                    scan_truncated = True
+                    break
+                p = dict(params)
+                p["page"] = page
+                resp = await fetch_openalex_page(client, p)
+                if resp is None:
+                    scan_truncated = True
+                    break
+                if resp.status_code != 200:
+                    if can_use_arxiv_fallback:
+                        fallback_results = await arxiv_search(query, limit, scan_deadline - time.monotonic())
+                        if fallback_results:
+                            return {
+                                "success": True,
+                                "results": fallback_results,
+                                "total": len(fallback_results),
+                                "truncated": len(fallback_results) >= limit,
+                                "source": "arxiv-fallback",
+                            }
+                    status_code = 503 if resp.status_code in (429, 503) else 502
+                    return JSONResponse(
+                        status_code=status_code,
+                        content={
+                            "success": False,
+                            "error": "OpenAlex paper search failed",
+                            "upstream_status": resp.status_code,
+                        },
+                    )
+                data = resp.json()
+                raw_total = data.get("meta", {}).get("count", raw_total)
+                page_results = data.get("results", [])
+                if not page_results:
+                    break
+                for work in page_results:
+                    result = oa_to_result(work)
+                    if matches(result):
+                        results.append(result)
+                        if len(results) >= limit:
+                            break
+                if len(page_results) < 200 or page * 200 >= raw_total:
+                    break
+                page += 1
+    except (httpx.HTTPError, ValueError) as error:
+        if can_use_arxiv_fallback:
+            fallback_results = await arxiv_search(query, limit, scan_deadline - time.monotonic())
+            if fallback_results:
+                return {
+                    "success": True,
+                    "results": fallback_results,
+                    "total": len(fallback_results),
+                    "truncated": len(fallback_results) >= limit,
+                    "source": "arxiv-fallback",
+                }
+        return JSONResponse(
+            status_code=502,
+            content={"success": False, "error": "OpenAlex paper search failed", "detail": str(error)},
+        )
 
     filtered = bool(authors or categories)
     return {
         "success": True,
         "results": results[:limit],
         "total": len(results) if filtered else raw_total,
-        "truncated": len(results) >= limit and (filtered or raw_total > limit),
+        "truncated": scan_truncated or (len(results) >= limit and (filtered or raw_total > limit)),
     }
 
 
@@ -912,16 +1065,45 @@ async def similar_papers_v2(
     origin: Optional[str] = Query(None),
     integration: Optional[str] = Query(None),
 ):
-    oa_id = await resolve_oa_id(paper_id)
-    if not oa_id:
-        return JSONResponse(status_code=404, content={"success": False, "error": "Paper not found"})
-
     limit = min(k or 40, 10000)
     traversal = mode or "similar"
     if traversal not in ("similar", "citers", "references"):
         return JSONResponse(status_code=400, content={"success": False, "error": "Unsupported related-paper mode"})
     rerank_enabled = rerank is True or str(rerank).lower() == "true"
     requested_anchors = request.query_params.getlist("anchor")
+    oa_id = await resolve_oa_id(paper_id)
+    if not oa_id:
+        # OpenAlex may be unavailable or rate-limited. Semantic Scholar accepts
+        # the same canonical IDs and supplies recommendations without requiring
+        # an OpenAlex work resolution.
+        if traversal == "similar":
+            fallback_results = await s2_recommendations(paper_id, limit)
+            if fallback_results:
+                if rerank_enabled:
+                    fallback_results.sort(
+                        key=lambda result: (-similarity_semantic_score(result, intent), result.get("paperId", "")),
+                    )
+                return {
+                    "success": True,
+                    "results": fallback_results[:limit],
+                    "poolSize": len(fallback_results),
+                    "truncated": len(fallback_results) > limit,
+                    "note": "Returned Semantic Scholar recommendations because OpenAlex could not resolve the seed.",
+                    "seed": {
+                        "requested": paper_id,
+                        "openalexId": None,
+                        "resolvedTitle": None,
+                        "anchors": requested_anchors,
+                    },
+                }
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "error": "Citation graph provider could not resolve the paper",
+                "detail": "OpenAlex resolution failed and no Semantic Scholar recommendations were available.",
+            },
+        )
 
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         primary_response = await client.get(
@@ -1580,7 +1762,7 @@ async def developer_search(
     if not query or not query.strip():
         return JSONResponse(status_code=400, content={"success": False, "error": "query is required"})
     limit = min(k or 10, 1000)
-    selected = {value.strip().lower() for value in (types or []) if value.strip()}
+    selected = normalize_developer_types(types)
     allowed_types = {"doc", "readme", "issue", "pull_request", "pr", "code"}
     if selected - allowed_types:
         return JSONResponse(status_code=400, content={"success": False, "error": "Unsupported developer search type"})

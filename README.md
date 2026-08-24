@@ -85,7 +85,8 @@ firecrawl-selfhost/
 | `interact` | Uses the local browser-session adapter layered onto Playwright |
 | `monitor_*` | Uses the local PostgreSQL schema and durable volume |
 | `feedback` / `search_feedback` | Uses the local PostgreSQL schema |
-| Screenshot/actions | Require a Fire Engine endpoint via `FIRE_ENGINE_BETA_URL` |
+| Screenshot | Uses the local Playwright renderer and returns a data URL |
+| Scrape actions/branding | Require a compatible Fire Engine endpoint via `FIRE_ENGINE_BETA_URL` |
 
 The local agent patch scrapes up to 10 supplied URLs (or searches when no URLs
 are provided), caps synthesis input at 400,000 characters, and persists job

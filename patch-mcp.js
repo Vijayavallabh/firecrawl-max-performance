@@ -130,7 +130,7 @@ function registerLocalDeveloperSearch(server2) {
       query: z3.string().min(1),
       k: z3.number().int().min(1).max(1000).optional(),
       passages: z3.number().int().min(1).max(5).optional(),
-      types: z3.array(z3.string()).optional(),
+      types: z3.array(z3.enum(["doc", "docs", "readme", "repo", "repos", "repo_readme", "issue", "issues", "pull_request", "pr", "prs", "pull_requests", "code"])).optional(),
       repos: z3.array(z3.string()).optional(),
       sources: z3.array(z3.string()).optional(),
       language: z3.string().optional(),
@@ -147,7 +147,9 @@ function registerLocalDeveloperSearch(server2) {
       if (!base) throw new Error("FIRECRAWL_API_URL is required for developer search");
       const credential = session && session.firecrawlApiKey || process.env.FIRECRAWL_API_KEY;
       const headers = { "Content-Type": "application/json", "X-Origin": "mcp-developer-search", ...(credential ? { Authorization: \`Bearer \${credential}\` } : {}) };
-      const response = await fetch(base + "/v2/search/developer", { method: "POST", headers, body: JSON.stringify(args2) });
+      const aliases = { docs: "doc", repo: "readme", repos: "readme", repo_readme: "readme", issues: "issue", pr: "pull_request", prs: "pull_request", pull_requests: "pull_request" };
+      const normalized = { ...args2, types: args2.types?.map(type => aliases[type] || type) };
+      const response = await fetch(base + "/v2/search/developer", { method: "POST", headers, body: JSON.stringify(normalized) });
       const text = await response.text();
       if (!response.ok) throw new Error(\`Developer search failed (\${response.status}): \${text}\`);
       return truncateMcpOutput(text);

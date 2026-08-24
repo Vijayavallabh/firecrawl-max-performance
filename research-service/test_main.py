@@ -1,12 +1,19 @@
+import os
 import sys
 import unittest
+from unittest.mock import patch
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from main import (  # noqa: E402
+    ARXIV_STOP_WORDS,
     build_github_code_query,
+    arxiv_entry_to_result,
+    bounded_env_number,
     normalize_title,
+    normalize_developer_types,
     oa_to_result,
     parse_paper_reference,
     rank_passages,
@@ -67,6 +74,32 @@ class ResearchHelpersTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_github_code_query("browser", repos=["owner/one", "owner/two"])
         self.assertEqual(normalize_title("A/B: Paper!"), "a b paper")
+
+    def test_developer_type_aliases_normalize_to_public_contract(self):
+        self.assertEqual(
+            normalize_developer_types(["docs", "issues", "prs", "repo_readme", "code"]),
+            {"doc", "issue", "pull_request", "readme", "code"},
+        )
+
+    def test_arxiv_entry_conversion_preserves_canonical_identifiers(self):
+        entry = ET.fromstring(
+            """<entry xmlns=\"http://www.w3.org/2005/Atom\"><id>http://arxiv.org/abs/1706.03762</id><title> Attention Is All You Need </title><summary> Transformer architecture </summary><published>2017-06-12T00:00:00Z</published><updated>2017-06-12T00:00:00Z</updated><author><name>A. Author</name></author><category term=\"cs.CL\" /></entry>"""
+        )
+        result = arxiv_entry_to_result(entry)
+        self.assertEqual(result["paperId"], "arxiv:1706.03762")
+        self.assertEqual(result["title"], "Attention Is All You Need")
+
+    def test_invalid_paper_search_limits_fall_back_to_defaults(self):
+        with patch.dict(os.environ, {"TEST_BAD_LIMIT": "not-a-number"}):
+            self.assertEqual(bounded_env_number("TEST_BAD_LIMIT", 10, 1, 50, int), 10)
+
+    def test_arxiv_fallback_keeps_meaningful_query_terms(self):
+        terms = [
+            term.lower()
+            for term in "API tool use benchmark for large language model agents".split()
+            if len(term) > 2 and term.lower() not in ARXIV_STOP_WORDS
+        ]
+        self.assertEqual(terms, ["api", "tool", "language", "agents"])
 
 
 if __name__ == "__main__":

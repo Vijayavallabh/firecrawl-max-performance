@@ -716,6 +716,11 @@ if [ -f "$BROWSER_AGENT" ]; then
 fi
 echo "  Done."
 
+# ── 9.5. Patch self-hosted local persistence and model routing ─────────
+echo "[9.5/10] Patching self-hosted local runtime features..."
+node "$SCRIPT_DIR/patch-local-runtime.js" "$FIRECRAWL_DIR"
+echo "  Done."
+
 # ── 10. Agent: replace external proxy with local in-memory agent ──────
 echo "[10/10] Patching agent controllers (local in-memory agent)..."
 

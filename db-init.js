@@ -31,6 +31,7 @@ const TABLES = [
   "monitor_email_recipients",
   "browser_sessions",
   "browser_session_activities",
+  "webhook_logs",
   "agents",
   "agent_sponsors",
   "idempotency_keys",
@@ -290,6 +291,59 @@ async function applyClaimFunction(client) {
   `);
 }
 
+async function applyLocalPersistence(client) {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS change_tracking_scrapes (
+      team_id text NOT NULL,
+      url text NOT NULL,
+      job_id text NOT NULL,
+      change_tracking_tag text,
+      date_added timestamptz NOT NULL
+    )
+  `);
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS change_tracking_scrapes_lookup_idx
+    ON change_tracking_scrapes (team_id, url, change_tracking_tag, date_added DESC)
+  `);
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS change_tracking_documents (
+      job_id text PRIMARY KEY,
+      document jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+  await client.query(`
+    CREATE OR REPLACE FUNCTION change_tracking_insert_scrape(
+      p_team_id text,
+      p_url text,
+      p_job_id text,
+      p_change_tracking_tag text,
+      p_date_added timestamptz
+    ) RETURNS void AS $$
+      INSERT INTO change_tracking_scrapes (
+        team_id, url, job_id, change_tracking_tag, date_added
+      ) VALUES (
+        p_team_id, p_url, p_job_id, p_change_tracking_tag, p_date_added
+      );
+    $$ LANGUAGE sql;
+  `);
+  await client.query(`
+    CREATE OR REPLACE FUNCTION diff_get_last_scrape_v7(
+      i_team_id text,
+      i_url text,
+      i_tag text
+    ) RETURNS TABLE(o_job_id text, o_date_added timestamptz) AS $$
+      SELECT job_id, date_added
+      FROM change_tracking_scrapes
+      WHERE team_id = i_team_id
+        AND url = i_url
+        AND change_tracking_tag IS NOT DISTINCT FROM i_tag
+      ORDER BY date_added DESC
+      LIMIT 1;
+    $$ LANGUAGE sql STABLE;
+  `);
+}
+
 (async () => {
   if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required");
   const client = new Client({ connectionString: process.env.DATABASE_URL });
@@ -315,6 +369,7 @@ async function applyClaimFunction(client) {
     await applyDefaults(client, tableMap);
     await applyIndexes(client);
     await applyClaimFunction(client);
+    await applyLocalPersistence(client);
     await client.query(`
       CREATE TABLE IF NOT EXISTS firecrawl_local_schema_migrations (
         version integer PRIMARY KEY,
@@ -323,11 +378,11 @@ async function applyClaimFunction(client) {
     `);
     await client.query(`
       INSERT INTO firecrawl_local_schema_migrations(version)
-      VALUES (2)
+      VALUES (3)
       ON CONFLICT (version) DO UPDATE SET applied_at = now()
     `);
     await client.query("COMMIT");
-    console.log("Local Firecrawl schema ready (version 2).");
+    console.log("Local Firecrawl schema ready (version 3).");
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     console.error(`Local schema initialization failed: ${error instanceof Error ? error.message : String(error)}`);
