@@ -25,6 +25,88 @@ function remove(relativePath, target) {
   fs.writeFileSync(file, source.replace(normalizedTarget, ""));
 }
 
+function ensureReadPageText() {
+  const relativePath = "apps/api/src/lib/scrape-interact/browser-agent.ts";
+  const file = path.join(root, relativePath);
+  let source = fs.readFileSync(file, "utf8");
+  const helper = `async function readPageText(browserId: string): Promise<string> {
+  try {
+    const result = await execInBrowser(
+      browserId,
+      'return await page.locator("body").innerText();',
+      SNAPSHOT_TIMEOUT,
+      "agent_page_text",
+      "node",
+    );
+    return (result.stdout || result.result || "").slice(0, SNAPSHOT_MAX_CHARS);
+  } catch {
+    return "";
+  }
+}`;
+  const existingHelper = /async function readPageText\(browserId: string\): Promise<string> \{\n  try \{\n    const result = await execInBrowser\(\n      browserId,\n      'return await page\.locator\("body"\)\.innerText\(\);',\n      SNAPSHOT_TIMEOUT,\n      "agent_page_text",\n(?:      "node",\n)?    \);\n    return \(result\.stdout \|\| result\.result \|\| ""\)\.slice\(0, SNAPSHOT_MAX_CHARS\);\n  \} catch \{\n    return "";\n  \}\n\}/g;
+  source = source.replace(existingHelper, "");
+  const snapshot = `async function takeSnapshot(browserId: string): Promise<string> {
+  try {
+    const result = await execInBrowser(
+      browserId,
+      "agent-browser snapshot -i",
+      SNAPSHOT_TIMEOUT,
+      "agent_snapshot",
+    );
+    return (result.stdout || result.result || "").slice(0, SNAPSHOT_MAX_CHARS);
+  } catch {
+    return "";
+  }
+}`;
+  if (!source.includes(snapshot)) {
+    throw new Error(`Patch target not found: ${relativePath}`);
+  }
+  fs.writeFileSync(file, source.replace(snapshot, `${snapshot}\n\n${helper}`));
+}
+
+// AI SDK 3.0.71 serializes client-executed tool calls as item references.
+// Fireworks requires the inline function-call format introduced in 3.0.73.
+patch(
+  "apps/api/package.json",
+  '"@ai-sdk/openai": "3.0.71"',
+  '"@ai-sdk/openai": "3.0.73"',
+);
+patch(
+  "apps/api/pnpm-lock.yaml",
+  "      '@ai-sdk/openai':\n        specifier: 3.0.71\n        version: 3.0.71(zod@4.1.12)",
+  "      '@ai-sdk/openai':\n        specifier: 3.0.73\n        version: 3.0.73(zod@4.1.12)",
+);
+patch(
+  "apps/api/pnpm-lock.yaml",
+  "  '@ai-sdk/openai@3.0.71':\n    resolution: {integrity: sha512-j6eBAa5oHFZ4U5CxpIV3T4zXNM/BviodNCZCL1qHkA4aqkwK9iQ18TWYz2DZcXpw4BO5pikKzqpXORxb1EnZGA==}",
+  "  '@ai-sdk/openai@3.0.73':\n    resolution: {integrity: sha512-+3x9oxHv9Xp33Iv2L8D+e5hqmZi64jofBKig/9611JKyfV59NdkaDDajtwc0CxOEfARgCVq1BW7dP+526gKOKw==}",
+);
+patch(
+  "apps/api/pnpm-lock.yaml",
+  "  '@ai-sdk/provider-utils@4.0.40':",
+  "  '@ai-sdk/provider-utils@4.0.30':\n    resolution: {integrity: sha512-VO7I+vPffqI5sMnPoUq5DCSqKIgQIk/naJWRdQVpz2ma2zoprC/lqiJiUEl2s6DfvTD76TbhD3q39ROjlA6rGw==}\n    engines: {node: '>=18'}\n    peerDependencies:\n      zod: ^3.25.76 || ^4.1.8\n\n  '@ai-sdk/provider-utils@4.0.40':",
+);
+patch(
+  "apps/api/pnpm-lock.yaml",
+  "  expect-type@1.3.0:",
+  "  eventsource-parser@3.1.1:\n    resolution: {integrity: sha512-EKN1vKAMcZ8MlYMpaNuxN6R9yakzH6uajHcHVTqWJzvu5pWw9DyhbP35HH8MVBQ+dZjAfDxk+A8NiR9KWaXiyQ==}\n    engines: {node: '>=18.0.0'}\n\n  expect-type@1.3.0:",
+);
+patch(
+  "apps/api/pnpm-lock.yaml",
+  "  '@ai-sdk/openai@3.0.71(zod@4.1.12)':\n    dependencies:\n      '@ai-sdk/provider': 3.0.10\n      '@ai-sdk/provider-utils': 4.0.29(zod@4.1.12)\n      zod: 4.1.12",
+  "  '@ai-sdk/openai@3.0.73(zod@4.1.12)':\n    dependencies:\n      '@ai-sdk/provider': 3.0.10\n      '@ai-sdk/provider-utils': 4.0.30(zod@4.1.12)\n      zod: 4.1.12",
+);
+patch(
+  "apps/api/pnpm-lock.yaml",
+  "  '@ai-sdk/provider-utils@4.0.40(zod@4.1.12)':",
+  "  '@ai-sdk/provider-utils@4.0.30(zod@4.1.12)':\n    dependencies:\n      '@ai-sdk/provider': 3.0.10\n      '@standard-schema/spec': 1.1.0\n      eventsource-parser: 3.1.1\n      zod: 4.1.12\n\n  '@ai-sdk/provider-utils@4.0.40(zod@4.1.12)':",
+);
+patch(
+  "apps/api/pnpm-lock.yaml",
+  "  expect-type@1.3.0: {}",
+  "  eventsource-parser@3.1.1: {}\n\n  expect-type@1.3.0: {}",
+);
+
 patch(
   "apps/api/src/scraper/scrapeURL/transformers/query.ts",
   'import { getModel } from "../../../lib/generic-ai";',
@@ -252,11 +334,7 @@ remove(
       },
   `,
 );
-patch(
-  "apps/api/src/lib/scrape-interact/browser-agent.ts",
-  "async function takeSnapshot(browserId: string): Promise<string> {\n  try {\n    const result = await execInBrowser(\n      browserId,\n      \"agent-browser snapshot -i\",\n      SNAPSHOT_TIMEOUT,\n      \"agent_snapshot\",\n    );\n    return (result.stdout || result.result || \"\").slice(0, SNAPSHOT_MAX_CHARS);\n  } catch {\n    return \"\";\n  }\n}",
-  "async function takeSnapshot(browserId: string): Promise<string> {\n  try {\n    const result = await execInBrowser(\n      browserId,\n      \"agent-browser snapshot -i\",\n      SNAPSHOT_TIMEOUT,\n      \"agent_snapshot\",\n    );\n    return (result.stdout || result.result || \"\").slice(0, SNAPSHOT_MAX_CHARS);\n  } catch {\n    return \"\";\n  }\n}\n\nasync function readPageText(browserId: string): Promise<string> {\n  try {\n    const result = await execInBrowser(\n      browserId,\n      'return await page.locator(\"body\").innerText();',\n      SNAPSHOT_TIMEOUT,\n      \"agent_page_text\",\n    );\n    return (result.stdout || result.result || \"\").slice(0, SNAPSHOT_MAX_CHARS);\n  } catch {\n    return \"\";\n  }\n}",
-);
+ensureReadPageText();
 patch(
   "apps/api/src/lib/scrape-interact/browser-agent.ts",
   "    logger.error(\"Agent failed\", { error: err });\n    debugLog.add(`\\n=== END: error — ${msg} ===\\n`);\n    await debugLog.flush();\n\n    return {",
@@ -266,11 +344,6 @@ patch(
   "apps/api/src/lib/scrape-interact/browser-agent.ts",
   "  origin: string,\n): Promise<BrowserServiceExecResponse> {\n  return browserServiceRequest<BrowserServiceExecResponse>(\n    \"POST\",\n    `/browsers/${browserId}/exec`,\n    { code, language: \"bash\", timeout, origin },",
   "  origin: string,\n  language: \"bash\" | \"node\" = \"bash\",\n): Promise<BrowserServiceExecResponse> {\n  return browserServiceRequest<BrowserServiceExecResponse>(\n    \"POST\",\n    `/browsers/${browserId}/exec`,\n    { code, language, timeout, origin },",
-);
-patch(
-  "apps/api/src/lib/scrape-interact/browser-agent.ts",
-  "      'return await page.locator(\"body\").innerText();',\n      SNAPSHOT_TIMEOUT,\n      \"agent_page_text\",\n    );",
-  "      'return await page.locator(\"body\").innerText();',\n      SNAPSHOT_TIMEOUT,\n      \"agent_page_text\",\n      \"node\",\n    );",
 );
 
 console.log("Patched local Firecrawl runtime features.");
