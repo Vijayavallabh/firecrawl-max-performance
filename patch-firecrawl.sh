@@ -35,7 +35,6 @@ cat > "$FIRECRAWL_DIR/apps/api/src/services/rate-limiter.ts" << 'RATELIMITER'
 import { RateLimiterRedis } from "rate-limiter-flexible";
 import { config } from "../config";
 import { RateLimiterMode } from "../types";
-import type { TeamFlags } from "../controllers/v1/types";
 import Redis from "ioredis";
 
 export const redisRateLimitClient = new Redis(config.REDIS_RATE_LIMIT_URL!, {
@@ -89,27 +88,10 @@ export function getRateLimiter(mode: RateLimiterMode): RateLimiterRedis {
   return createRateLimiter(`${mode}`, rateLimit);
 }
 
-export function getRateLimitOverride(
-  mode: RateLimiterMode,
-  overrides: unknown,
-): number | undefined {
-  if (typeof overrides !== "object" || overrides === null) return undefined;
-  const value = (overrides as Record<string, unknown>)[mode];
-  if (typeof value !== "number") return undefined;
-  if (!Number.isInteger(value) || value <= 0) return undefined;
-  return value;
-}
-
 export function getAutumnRateLimiter(
   mode: RateLimiterMode,
   multiplier: number = 1,
-  flags?: TeamFlags,
 ): RateLimiterRedis {
-  const override = getRateLimitOverride(mode, flags?.rateLimitOverrides);
-  if (override !== undefined) {
-    return createRateLimiter(`${mode}`, override);
-  }
-
   const base = BASE_RATE_LIMITS[mode];
   let rateLimit: number;
   if (base !== undefined) {
@@ -423,6 +405,7 @@ if [ -d "$SCRIPT_DIR/research-service" ]; then
 else
   echo "  WARNING: research-service directory not found alongside this script."
 fi
+cp -f "$SCRIPT_DIR/db-init.js" "$FIRECRAWL_DIR/db-init.js"
 if [ -f "$SCRIPT_DIR/browser-session-adapter.ts" ]; then
   require_file "$FIRECRAWL_DIR/apps/playwright-service-ts/api.ts"
   cp -f "$SCRIPT_DIR/browser-session-adapter.ts" \
@@ -512,6 +495,87 @@ if ! grep -q "  searxng:" "$COMPOSE"; then
   sed -i '/^  fdb-cluster-file:/a\  searxng-data:' "$COMPOSE"
 fi
 
+# Give the bundled PostgreSQL durable storage and a readiness signal, then run
+# the idempotent application-schema bootstrap before the API starts. This is
+# what makes monitor, feedback, interact, request logging, and durable agent
+# jobs genuinely available with USE_DB_AUTHENTICATION=false.
+python3 - "$COMPOSE" << 'PYLOCALDBSERVICE'
+import re
+import sys
+
+p = sys.argv[1]
+s = open(p).read()
+service_pattern = re.compile(
+    r"(?ms)(^  nuq-postgres:\n.*?)(?=^  [a-zA-Z0-9_-]+:\n|^networks:\n)",
+)
+match = service_pattern.search(s)
+if not match:
+    raise SystemExit("nuq-postgres service not found")
+block = match.group(1)
+if "      - pg-data:/var/lib/postgresql/data" not in block:
+    marker = "    networks:\n      - backend\n"
+    if marker not in block:
+        raise SystemExit("nuq-postgres network anchor not found")
+    block = block.replace(
+        marker,
+        marker + "    volumes:\n      - pg-data:/var/lib/postgresql/data\n",
+        1,
+    )
+if "pg_isready" not in block:
+    marker = "    logging:\n"
+    health = '''    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+'''
+    if marker not in block:
+        raise SystemExit("nuq-postgres logging anchor not found")
+    block = block.replace(marker, health + marker, 1)
+s = s[:match.start(1)] + block + s[match.end(1):]
+
+if "\n  db-init:\n" not in s:
+    db_init = '''
+  db-init:
+    restart: "no"
+    <<: *common-service
+    environment:
+      <<: *common-env
+      ENV: local
+    depends_on:
+      nuq-postgres:
+        condition: service_healthy
+    volumes:
+      - ./db-init.js:/tmp/db-init.js:ro
+    command: ["node", "/tmp/db-init.js"]
+
+'''
+    if "\nnetworks:\n" not in s:
+        raise SystemExit("compose networks anchor not found")
+    s = s.replace("\nnetworks:\n", db_init + "networks:\n", 1)
+
+if not re.search(r"(?m)^  pg-data:\s*$", s):
+    s = s.replace("\nvolumes:\n", "\nvolumes:\n  pg-data:\n", 1)
+
+api = re.search(r"(?ms)(^  api:\n.*?)(?=^  [a-zA-Z0-9_-]+:\n|^networks:\n)", s)
+if not api:
+    raise SystemExit("api service not found")
+api_block = api.group(1)
+if "      db-init:\n        condition: service_completed_successfully" not in api_block:
+    anchor = "    depends_on:\n"
+    if anchor not in api_block:
+        raise SystemExit("api depends_on anchor not found")
+    api_block = api_block.replace(
+        anchor,
+        anchor + "      db-init:\n        condition: service_completed_successfully\n",
+        1,
+    )
+    s = s[:api.start(1)] + api_block + s[api.end(1):]
+
+open(p, "w").write(s)
+PYLOCALDBSERVICE
+
 # Copy SearXNG settings into the path used by the patched Compose file.
 if [ -f "$SCRIPT_DIR/searxng/settings.yml" ]; then
   mkdir -p "$FIRECRAWL_DIR/searxng"
@@ -519,9 +583,30 @@ if [ -f "$SCRIPT_DIR/searxng/settings.yml" ]; then
 fi
 
 # Restart policy: keep all long-running services up across reboots
-# (foundationdb-init stays one-shot). Must run after the searxng /
-# research-service blocks above are appended.
-perl -0777 -pi -e 's/^  (playwright-service|api|redis|rabbitmq|nuq-postgres|foundationdb|searxng|research-service):\n(?![ \t]*restart:)/  ${1}:\n    restart: unless-stopped\n/gm' "$COMPOSE"
+# (foundationdb-init and db-init stay one-shot). Rewrite each complete service
+# block so rerunning the patcher cannot accumulate duplicate YAML keys.
+python3 - "$COMPOSE" << 'PYRESTARTPOLICY'
+import re
+import sys
+
+p = sys.argv[1]
+s = open(p).read()
+services = {
+    "playwright-service", "api", "redis", "rabbitmq", "nuq-postgres",
+    "foundationdb", "searxng", "research-service",
+}
+pattern = re.compile(r"(?ms)^  ([a-zA-Z0-9_-]+):\n(.*?)(?=^  [a-zA-Z0-9_-]+:\n|^networks:\n|^volumes:\n|\Z)")
+
+def normalize(match):
+    name, body = match.group(1), match.group(2)
+    if name not in services:
+        return match.group(0)
+    body = re.sub(r"(?m)^    restart:.*\n", "", body)
+    return f"  {name}:\n    restart: unless-stopped\n{body}"
+
+s = pattern.sub(normalize, s)
+open(p, "w").write(s)
+PYRESTARTPOLICY
 python3 - "$COMPOSE" << 'PYFDBCOMPOSE'
 import sys
 p = sys.argv[1]
@@ -531,26 +616,19 @@ open(p, "w").write(s)
 PYFDBCOMPOSE
 echo "  Done."
 
-# ── 7. Patch MCP server (if installed via npx cache) ─────────────────
-echo "[7/10] Patching MCP server limits (if installed)..."
-MCP_JS=""
+# ── 7. Patch every MCP server installed via npx cache ─────────────────
+echo "[7/10] Patching MCP server limits and reliability..."
+MCP_BUNDLE_FOUND=""
 for cache_root in "${HOME:-/home}/.npm" "${HOME:-/home}/.cache" "${HOME:-/home}/.local" /usr/local/lib/node_modules; do
-  if [ -d "$cache_root" ]; then
-    MCP_JS=$(find "$cache_root" -path "*/firecrawl-mcp/dist/index.js" -print -quit 2>/dev/null || true)
+  if [ -d "$cache_root" ] && find "$cache_root" -path "*/firecrawl-mcp/dist/index.js" -print -quit 2>/dev/null | grep -q .; then
+    MCP_BUNDLE_FOUND=1
+    break
   fi
-  [ -n "$MCP_JS" ] && break
 done
-if [ -n "$MCP_JS" ]; then
-  echo "  Found MCP server at: $MCP_JS"
-  SDK_JS=""
-  for cache_root in "${HOME:-/home}/.npm" "${HOME:-/home}/.cache" "${HOME:-/home}/.local" /usr/local/lib/node_modules; do
-    if [ -d "$cache_root" ]; then
-      SDK_JS=$(find "$cache_root" -path "*/@mendable/firecrawl-js/dist/index.js" -print -quit 2>/dev/null || true)
-    fi
-    [ -n "$SDK_JS" ] && break
-  done
-  node "$SCRIPT_DIR/patch-mcp.js" "$MCP_JS" "$SDK_JS"
-  echo "  Patched MCP server limits."
+if [ -n "$MCP_BUNDLE_FOUND" ]; then
+  # A transformer failure is a real error and must stop the parent patcher.
+  bash "$SCRIPT_DIR/patch-mcp.sh"
+  echo "  Patched every cached MCP bundle."
 else
   echo "  MCP server not found — run patch-mcp.sh after installing firecrawl-mcp."
 fi
@@ -746,7 +824,7 @@ import { getScrapeZDR } from "../../lib/zdr-helpers";
 import { getModelFast } from "../../lib/generic-ai";
 import { sql } from "drizzle-orm";
 import { db } from "../../db/connection";
-import { generateText } from "ai";
+import { generateObject, generateText, jsonSchema } from "ai";
 
 export const agentJobs = new Map<string, {
   id: string;
@@ -760,6 +838,7 @@ export const agentJobs = new Map<string, {
   created_at: number;
   model: string;
   cancelled: boolean;
+  creditsUsed: number;
 }>();
 
 const AGENT_MAX_URLS = 10;
@@ -775,18 +854,19 @@ async function persistAgentJob(job: any): Promise<void> {
   try {
     await db.execute(sql`
       INSERT INTO agent_jobs
-        (id, team_id, status, prompt, urls, request_schema, data, error, model, created_at, updated_at)
+        (id, team_id, status, prompt, urls, request_schema, data, error, model, credits_used, created_at, updated_at)
       VALUES
         (${job.id}, ${job.team_id}, ${job.status}, ${job.prompt},
          ${job.urls ? JSON.stringify(job.urls) : null}::jsonb,
          ${job.schema ? JSON.stringify(job.schema) : null}::jsonb,
          ${job.data ? JSON.stringify(job.data) : null}::jsonb,
-         ${job.error ?? null}, ${job.model},
+         ${job.error ?? null}, ${job.model}, ${job.creditsUsed ?? 0},
          to_timestamp(${job.created_at} / 1000.0), now())
       ON CONFLICT (id) DO UPDATE SET
         status = excluded.status,
         data = excluded.data,
         error = excluded.error,
+        credits_used = excluded.credits_used,
         updated_at = now()
     `);
   } catch (error) {
@@ -799,7 +879,7 @@ export async function loadAgentJob(id: string, teamId: string): Promise<any | nu
   try {
     const result: any = await db.execute(sql`
       SELECT id, team_id, status, prompt, urls, request_schema, data, error,
-             model, extract(epoch from created_at) * 1000 AS created_at
+             model, credits_used, extract(epoch from created_at) * 1000 AS created_at
       FROM agent_jobs
       WHERE id = ${id} AND team_id = ${teamId}
       LIMIT 1
@@ -826,6 +906,7 @@ export async function loadAgentJob(id: string, teamId: string): Promise<any | nu
       created_at: Number(row.created_at),
       model: row.model,
       cancelled: row.status === "failed" && row.error === "Agent cancelled by user",
+      creditsUsed: Number(row.credits_used ?? 0),
     };
   } catch (error) {
     _logger.warn("Failed to load agent job", { error, agentId: id });
@@ -859,7 +940,9 @@ export async function agentController(
   agentJobs.set(agentId, {
     id: agentId, team_id: req.auth.team_id, status: "processing",
     prompt: req.body.prompt ?? "", urls: req.body.urls, schema: req.body.schema,
-    created_at: Date.now(), model: req.body.model ?? "spark-1-pro", cancelled: false,
+    created_at: Date.now(),
+    model: config.MODEL_NAME_FAST ?? config.MODEL_NAME ?? req.body.model ?? "gpt-4o-mini",
+    cancelled: false, creditsUsed: 0,
   });
   void persistAgentJob(agentJobs.get(agentId));
 
@@ -895,6 +978,7 @@ async function runAgentAsync(agentId: string, body: AgentRequest, teamId: string
       });
       if (r.ok) {
         const d = await r.json();
+        job.creditsUsed += Number(d.data?.metadata?.creditsUsed ?? 0);
         const md = d.data?.markdown;
         if (md) scrapedContent.push(`## Content from ${url}\n\n${md}`);
       }
@@ -910,6 +994,7 @@ async function runAgentAsync(agentId: string, body: AgentRequest, teamId: string
       });
       if (sr.ok) {
         const sd = await sr.json();
+        job.creditsUsed += Number(sd.creditsUsed ?? 0);
         const results = sd.data?.web ?? [];
         for (const result of results.slice(0, 3)) {
           if (job.cancelled) break;
@@ -921,6 +1006,7 @@ async function runAgentAsync(agentId: string, body: AgentRequest, teamId: string
             });
             if (r.ok) {
               const d = await r.json();
+              job.creditsUsed += Number(d.data?.metadata?.creditsUsed ?? 0);
               const md = d.data?.markdown;
               if (md) scrapedContent.push(`## Content from ${result.url}\n\n${md}`);
             }
@@ -937,8 +1023,13 @@ async function runAgentAsync(agentId: string, body: AgentRequest, teamId: string
   try {
     const model = getModelFast("gpt-4o-mini");
     if (schema) {
-      const { generateObject } = await import("ai");
-      const result = await generateObject({ model, schema, system: `You are a research agent. Answer: ${prompt}`, prompt: allContent, temperature: 0 });
+      const result = await generateObject({
+        model,
+        schema: jsonSchema(schema),
+        system: `You are a research agent. Answer: ${prompt}`,
+        prompt: allContent,
+        temperature: 0,
+      });
       if (job.cancelled) { updateAgentJob(job, { status: "failed", error: "Cancelled" }); return; }
       job.data = result.object;
     } else {
@@ -987,7 +1078,7 @@ export async function agentStatusController(
         status: !agent ? "processing" : agent.is_successful ? "completed" : "failed",
         error: agent?.error || undefined,
         data,
-        model: agent?.options?.model ?? "spark-1-pro",
+        model: agent?.options?.model ?? config.MODEL_NAME_FAST ?? config.MODEL_NAME,
         expiresAt: new Date(
           new Date(agent?.created_at ?? request.created_at).getTime() + 1000 * 60 * 60 * 24,
         ).toISOString(),
@@ -1005,9 +1096,9 @@ export async function agentStatusController(
   return res.status(200).json({
     success: true, status: job.status, error: job.error || undefined,
     data: job.status === "completed" ? job.data : undefined,
-    model: job.model as "spark-1-pro" | "spark-1-mini" | "spark-2",
+    model: job.model as any,
     expiresAt: new Date(job.created_at + 1000 * 60 * 60 * 24).toISOString(),
-    creditsUsed: 20,
+    creditsUsed: job.creditsUsed ?? 0,
   });
 }
 AGENTSTATUSTS
@@ -1172,9 +1263,10 @@ function relevanceOrder(q: string, items: any[]): any[] {
     return { item, score, idx };
   });
   scored.sort((a, b) => b.score - a.score || a.idx - b.idx);
-  const relevant = scored.filter(s => s.score > 0);
-  const ordered = relevant.length > 0 ? relevant : scored;
-  return ordered.map(s => s.item);
+  // Never turn a provider outage, poisoned cache entry, or anti-bot result
+  // into a successful but unrelated search response. An empty result lets the
+  // caller try its next provider instead.
+  return scored.filter(s => s.score > 0).map(s => s.item);
 }
 
 /**
@@ -1274,87 +1366,19 @@ export async function searxngSearchV2(
 SEARXNGSOURCES
 
 V2_SEARCH_INDEX="$FIRECRAWL_DIR/apps/api/src/search/v2/index.ts"
-if ! grep -q "searxngSearchV2" "$V2_SEARCH_INDEX"; then
-  perl -0777 -pi -e 's/import \{ searxng_search \} from "\.\/searxng";/import { searxngSearchV2 } from ".\/searxng-sources";/' "$V2_SEARCH_INDEX"
-  perl -0777 -pi -e 's/if \(config\.SEARXNG_ENDPOINT\) \{\n      logger\.info\("Using searxng search"\);\n      const results = await searxng_search\(query, \{\n        num_results,\n        tbs,\n        filter,\n        lang,\n        country,\n        location,\n        safe,\n      \}\);\n      if \(results\.web && results\.web\.length > 0\) return results;\n    \}/if (config.SEARXNG_ENDPOINT) {\n      logger.info("Using searxng search");\n      const requestedTypes = Array.isArray(type)\n        ? type\n        : type\n          ? [type]\n          : undefined;\n      const results = await searxngSearchV2(\n        query,\n        num_results,\n        requestedTypes,\n        lang,\n      );\n      if (results.web?.length || results.news?.length || results.images?.length) {\n        return results;\n      }\n    }/' "$V2_SEARCH_INDEX"
-fi
-python3 - "$V2_SEARCH_INDEX" << 'PYSERAXINDEX'
-import sys
-p = sys.argv[1]
-s = open(p).read()
-old = '''      const results = await searxngSearchV2(
-        query,
-        num_results,
-        requestedTypes,
-        lang,
-      );
-      if (results.web?.length || results.news?.length || results.images?.length) {
-        return results;
-      }'''
-new = '''      const results = await searxngSearchV2(
-        query,
-        num_results,
-        requestedTypes,
-        lang,
-        { tbs, filter, country, location, safe },
-      );
-      const hasResults =
-        results.web?.length || results.news?.length || results.images?.length;
-      if (hasResults) return results;
-      const webRequested = !requestedTypes || requestedTypes.includes("web");
-      if (!webRequested) {
-        return requestedTypes?.reduce((empty, resultType) => {
-          if (resultType === "news") empty.news = [];
-          if (resultType === "images") empty.images = [];
-          return empty;
-        }, {} as SearchV2Response) ?? {};
-      }'''
-if old in s:
-    s = s.replace(old, new, 1)
-open(p, "w").write(s)
-PYSERAXINDEX
-python3 - "$V2_SEARCH_INDEX" << 'PYSERAXINDEX2'
-import re, sys
-p = sys.argv[1]
-s = open(p).read()
-pattern = r'''const results = await searxngSearchV2\(\s*query,\s*num_results,\s*requestedTypes,\s*lang,\s*\);\s*if \(results\.web\?\.length \|\| results\.news\?\.length \|\| results\.images\?\.length\) \{\s*return results;\s*\}'''
-replacement = '''const results = await searxngSearchV2(
-        query,
-        num_results,
-        requestedTypes,
-        lang,
-        { tbs, filter, country, location, safe },
-      );
-      const hasResults =
-        results.web?.length || results.news?.length || results.images?.length;
-      if (hasResults) return results;
-      const webRequested = !requestedTypes || requestedTypes.includes("web");
-      if (!webRequested) {
-        return requestedTypes?.reduce((empty, resultType) => {
-          if (resultType === "news") empty.news = [];
-          if (resultType === "images") empty.images = [];
-          return empty;
-        }, {} as SearchV2Response) ?? {};
-      }'''
-s, count = re.subn(pattern, replacement, s, count=1)
-if count != 1 and "{ tbs, filter, country, location, safe }" not in s:
-    raise SystemExit("SearXNG search call not found")
-open(p, "w").write(s)
-PYSERAXINDEX2
 python3 - "$V2_SEARCH_INDEX" << 'PYSERAXINDEX3'
+import re
 import sys
 p = sys.argv[1]
 s = open(p).read()
+s = s.replace(
+    'import { searxng_search } from "./searxng";',
+    'import { searxngSearchV2 } from "./searxng-sources";',
+)
 if "sourceOptions = undefined" not in s:
     s = s.replace(
         "  type = undefined,\n  enterprise = undefined,",
         "  type = undefined,\n  sourceOptions = undefined,\n  enterprise = undefined,",
-        1,
-    )
-if "        sourceOptions,\n        { tbs, filter, country, location, safe }," not in s:
-    s = s.replace(
-        "        requestedTypes,\n        lang,\n        { tbs, filter, country, location, safe },",
-        "        requestedTypes,\n        lang,\n        sourceOptions,\n        { tbs, filter, country, location, safe },",
         1,
     )
 if "  sourceOptions?: Array" not in s:
@@ -1363,15 +1387,48 @@ if "  sourceOptions?: Array" not in s:
         "  type?: SearchResultType | SearchResultType[];\n  sourceOptions?: Array<{ type: SearchResultType; tbs?: string; filter?: string; lang?: string; country?: string; location?: string }>;\n",
         1,
     )
-lines = []
-seen_source_options = False
-for line in s.splitlines():
-    if line.strip().startswith("sourceOptions?: Array"):
-        if seen_source_options:
-            continue
-        seen_source_options = True
-    lines.append(line)
-s = "\n".join(lines) + "\n"
+
+replacement = '''if (config.SEARXNG_ENDPOINT) {
+    try {
+      logger.info("Using searxng search");
+      const requestedTypes = Array.isArray(type)
+        ? type
+        : type
+          ? [type]
+          : undefined;
+      const results = await searxngSearchV2(
+        query,
+        num_results,
+        requestedTypes,
+        lang,
+        sourceOptions,
+        { tbs, filter, country, location, safe },
+      );
+      const hasResults =
+        results.web?.length || results.news?.length || results.images?.length;
+      if (hasResults) return results;
+      const webRequested = !requestedTypes || requestedTypes.includes("web");
+      if (!webRequested) {
+        return requestedTypes?.reduce((empty, resultType) => {
+          if (resultType === "news") empty.news = [];
+          if (resultType === "images") empty.images = [];
+          return empty;
+        }, {} as SearchV2Response) ?? {};
+      }
+    } catch (error) {
+      providerFailures.push("searxng");
+      logger.error("SearXNG search failed", { error });
+    }
+  }
+
+  '''
+pattern = re.compile(
+    r'if \(config\.SEARXNG_ENDPOINT\) \{.*?\n  \}\n\n  (?=try \{\n    logger\.info\("Using DuckDuckGo search"\))',
+    re.S,
+)
+s, count = pattern.subn(replacement, s, count=1)
+if count != 1:
+    raise SystemExit("SearXNG provider block not found")
 open(p, "w").write(s)
 PYSERAXINDEX3
 python3 - "$FIRECRAWL_DIR/apps/api/src/search/execute.ts" << 'PYSEARCHEXECUTE'
@@ -1379,10 +1436,120 @@ import sys
 p = sys.argv[1]
 s = open(p).read()
 s = s.replace(
+    "  const num_results_buffer = Math.floor(limit * 2);",
+    '  const constrainedSearch = Boolean(options.includeDomains?.length || options.excludeDomains?.length || categories?.some(category => (typeof category === "string" ? category : category.type) !== "developer"));\n  const num_results_buffer = constrainedSearch\n    ? Math.min(100, Math.max(limit * 10, 20))\n    : Math.floor(limit * 2);',
+)
+helper = r'''
+async function searchResearchIndex(
+  query: string,
+  limit: number,
+  logger: Logger,
+): Promise<SearchV2Response | undefined> {
+  if (!config.RESEARCH_PROXY_URL) return undefined;
+  try {
+    const endpoint = new URL("v2/research/papers", `${config.RESEARCH_PROXY_URL.replace(/\/$/, "")}/`);
+    endpoint.searchParams.set("query", query);
+    endpoint.searchParams.set("k", String(limit));
+    const response = await fetch(endpoint, { signal: AbortSignal.timeout(30_000) });
+    if (!response.ok) throw new Error(`research index returned HTTP ${response.status}`);
+    const payload = (await response.json()) as { results?: any[] };
+    const web = (payload.results ?? []).flatMap(paper => {
+      const pmid = paper.ids?.pmid?.[0];
+      const primaryId = typeof paper.primaryId === "string" ? paper.primaryId : "";
+      const url = typeof pmid === "string"
+        ? (pmid.startsWith("http") ? pmid : `https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(pmid)}/`)
+        : primaryId.startsWith("doi:")
+          ? `https://doi.org/${primaryId.slice(4)}`
+          : primaryId.startsWith("arxiv:")
+            ? `https://arxiv.org/abs/${primaryId.slice(6)}`
+            : undefined;
+      return url ? [{
+        url,
+        title: paper.title ?? "(untitled research paper)",
+        description: paper.abstract ?? "",
+      }] : [];
+    });
+    return web.length > 0 ? { web } : undefined;
+  } catch (error) {
+    logger.warn("Dedicated research-index search failed; using web providers", { error });
+    return undefined;
+  }
+}
+'''
+if "async function searchResearchIndex(" not in s:
+    anchor = "\nexport async function executeSearch("
+    if anchor not in s:
+        raise SystemExit("research-index helper insertion point not found")
+    s = s.replace(anchor, helper + anchor, 1)
+s = s.replace(
+    "  const { query: searchQuery, categoryMap } = buildSearchQuery(\n    query,",
+    "  const { categoryMap } = buildSearchQuery(\n    query,",
+)
+s = s.replace("    query: searchQuery,", "    // Local SearXNG engines are unreliable with site:/filetype: operators.\n    // Fetch broadly, then enforce every constraint below at the API boundary.\n    query,", 1)
+s = s.replace(
+    "  const searchResponse = (await search({",
+    '''  const researchCategoryRequested = (categories ?? []).some(
+    category => (typeof category === "string" ? category : category.type) === "research",
+  );
+  let searchResponse = researchCategoryRequested
+    ? await searchResearchIndex(query, num_results_buffer, logger)
+    : undefined;
+  searchResponse ??= await search({''',
+    1,
+)
+s = s.replace("  })) as SearchV2Response;", "  }) as SearchV2Response;", 1)
+s = s.replace(
     "        type: searchTypes,\n        enterprise: options.enterprise,",
     "        type: searchTypes,\n        sourceOptions: sources as any,\n        enterprise: options.enterprise,",
     1,
 )
+anchor = "\n  if (developerResults) {"
+guard = r'''
+  // Providers are advisory; the API contract is authoritative. SearXNG (and
+  // especially Bing) can ignore operators or return poisoned cached results,
+  // so enforce domain/category constraints before counting, billing, scraping,
+  // tracking, or returning anything.
+  const normalizedDomains = (values?: string[]) =>
+    (values ?? []).map(value => value.trim().toLowerCase().replace(/^\.+|\.+$/g, "")).filter(Boolean);
+  const includeDomains = normalizedDomains(options.includeDomains);
+  const excludeDomains = normalizedDomains(options.excludeDomains);
+  const matchesDomain = (url: string | undefined, domain: string): boolean => {
+    if (!url) return false;
+    try {
+      const hostname = new URL(url).hostname.toLowerCase();
+      return hostname === domain || hostname.endsWith(`.${domain}`);
+    } catch {
+      return false;
+    }
+  };
+  const requestedCategories = new Set(
+    (categories ?? [])
+      .map(category => typeof category === "string" ? category : category.type)
+      .filter(category => category !== "developer"),
+  );
+  // The research service may identify a paper only by DOI or return a direct
+  // PMC full-text URL. Both are scholarly results even though older upstream
+  // defaults omitted these hosts.
+  if (requestedCategories.has("research")) {
+    categoryMap.set("doi.org", "research");
+    categoryMap.set("pmc.ncbi.nlm.nih.gov", "research");
+  }
+  const resultAllowed = (url: string | undefined): boolean => {
+    if (!url) return false;
+    if (includeDomains.length > 0 && !includeDomains.some(domain => matchesDomain(url, domain))) return false;
+    if (excludeDomains.some(domain => matchesDomain(url, domain))) return false;
+    if (requestedCategories.size === 0) return true;
+    const category = getCategoryFromUrl(url, categoryMap);
+    return category !== undefined && requestedCategories.has(category);
+  };
+  if (searchResponse.web) searchResponse.web = searchResponse.web.filter(item => resultAllowed(item.url));
+  if (searchResponse.news) searchResponse.news = searchResponse.news.filter(item => resultAllowed(item.url));
+  if (searchResponse.images) searchResponse.images = searchResponse.images.filter(item => resultAllowed(item.url));
+'''
+if "Providers are advisory; the API contract is authoritative" not in s:
+    if anchor not in s:
+        raise SystemExit("executeSearch constraint insertion point not found")
+    s = s.replace(anchor, guard + anchor, 1)
 open(p, "w").write(s)
 PYSEARCHEXECUTE
 echo "  Done."
@@ -1529,6 +1696,107 @@ s = open(p).read()
 s = s.replace("const indexWorker = (config.USE_DB_AUTHENTICATION || !!config.DATABASE_URL)", "const indexWorker = config.USE_DB_AUTHENTICATION")
 open(p, "w").write(s)
 PYHARNESS
+
+cat > "$FIRECRAWL_DIR/apps/api/src/lib/scrape-content-quality.ts" << 'SCRAPEQUALITY'
+type ScrapeContent = {
+  markdown?: unknown;
+  html?: unknown;
+  rawHtml?: unknown;
+  summary?: unknown;
+};
+
+/** Detect provider interstitials that carry HTTP 200 but no requested content. */
+export function detectAccessInterstitial(doc: ScrapeContent | null): string | undefined {
+  if (!doc) return undefined;
+  const content = [doc.markdown, doc.html, doc.rawHtml, doc.summary]
+    .filter((value): value is string => typeof value === "string")
+    .join("\n")
+    .toLowerCase();
+  if (!content) return undefined;
+
+  if (
+    content.includes("cookies must be enabled") &&
+    content.includes("enable cookies for") &&
+    content.includes("reload this page")
+  ) {
+    return "The origin returned a cookie access interstitial instead of page content.";
+  }
+  if (
+    content.includes("enable javascript and cookies to continue") &&
+    (content.includes("just a moment") || content.includes("cloudflare"))
+  ) {
+    return "The origin returned an anti-bot interstitial instead of page content.";
+  }
+  if (
+    content.includes("attention required") &&
+    content.includes("cloudflare ray id")
+  ) {
+    return "The origin returned an anti-bot challenge instead of page content.";
+  }
+  return undefined;
+}
+SCRAPEQUALITY
+
+python3 - "$FIRECRAWL_DIR/apps/api/src/lib/error.ts" << 'PYQUALITYERROR'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+code = '  | "SCRAPE_ACCESS_INTERSTITIAL"\n'
+if code not in s:
+    anchor = '  | "SCRAPE_MEDIA_ACCESS_DENIED"\n'
+    if anchor not in s:
+        raise SystemExit("scrape error-code anchor not found")
+    s = s.replace(anchor, anchor + code, 1)
+open(p, "w").write(s)
+PYQUALITYERROR
+
+python3 - "$FIRECRAWL_DIR/apps/api/src/lib/error-serde.ts" << 'PYQUALITYSERDE'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+entry = '  // Access interstitials are rejected synchronously by the HTTP controller.\n  SCRAPE_ACCESS_INTERSTITIAL: null,\n'
+if "SCRAPE_ACCESS_INTERSTITIAL:" not in s:
+    anchor = '  SCRAPE_MEDIA_ACCESS_DENIED: MediaAccessDeniedError,\n'
+    if anchor not in s:
+        raise SystemExit("scrape error-serde anchor not found")
+    s = s.replace(anchor, anchor + entry, 1)
+open(p, "w").write(s)
+PYQUALITYSERDE
+
+SCRAPE_TS="$FIRECRAWL_DIR/apps/api/src/controllers/v2/scrape.ts"
+python3 - "$SCRAPE_TS" << 'PYSCRAPEQUALITY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+import_line = 'import { detectAccessInterstitial } from "../../lib/scrape-content-quality";'
+if import_line not in s:
+    anchor = 'import { getEffectiveConcurrencyLimit } from "../../lib/concurrency-limit";'
+    if anchor not in s:
+        raise SystemExit("scrape content-quality import anchor not found")
+    s = s.replace(anchor, anchor + "\n" + import_line, 1)
+snippet = '''
+      const accessInterstitial = detectAccessInterstitial(doc);
+      if (accessInterstitial) {
+        logger.warn("Rejecting scrape access interstitial", {
+          url: req.body.url,
+          scrapeId: jobId,
+          reason: accessInterstitial,
+        });
+        return res.status(502).json({
+          success: false,
+          code: "SCRAPE_ACCESS_INTERSTITIAL",
+          error: accessInterstitial,
+        });
+      }
+'''
+if snippet.strip() not in s:
+    anchor = '''      if (reservedKeylessCredits > 0 && !reconciledKeylessCredits) {'''
+    position = s.rfind(anchor)
+    if position < 0:
+        raise SystemExit("scrape content-quality response anchor not found")
+    s = s[:position] + snippet + "\n" + s[position:]
+open(p, "w").write(s)
+PYSCRAPEQUALITY
 
 ACTIVITY="$FIRECRAWL_DIR/apps/api/src/lib/browser-session-activity.ts"
 python3 - "$ACTIVITY" << 'PYACTIVITY'

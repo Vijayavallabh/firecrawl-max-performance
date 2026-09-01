@@ -132,6 +132,7 @@ async function createAgentJobsTable(client) {
       data jsonb,
       error text,
       model text NOT NULL,
+      credits_used integer NOT NULL DEFAULT 0,
       created_at timestamptz NOT NULL DEFAULT now(),
       updated_at timestamptz NOT NULL DEFAULT now()
     )
@@ -151,6 +152,12 @@ async function addMissingColumns(client, tableName, table) {
     );
     console.log(`ADD: ${tableName}.${column.name}`);
   }
+}
+
+async function ensureAgentJobColumns(client) {
+  await client.query(
+    "ALTER TABLE agent_jobs ADD COLUMN IF NOT EXISTS credits_used integer NOT NULL DEFAULT 0",
+  );
 }
 
 async function normalizeKnownTypes(client) {
@@ -365,6 +372,7 @@ async function applyLocalPersistence(client) {
     }
 
     await createAgentJobsTable(client);
+    await ensureAgentJobColumns(client);
     await normalizeKnownTypes(client);
     await applyDefaults(client, tableMap);
     await applyIndexes(client);

@@ -20,7 +20,14 @@ source = source.replace(
 );
 source = source.replace(
   `function localToolUnavailable(toolName) {\n  if (!process.env.FIRECRAWL_API_URL) return false;\n  if ((process.env.FIRECRAWL_SELF_HOSTED_DB_ENABLED || "").toLowerCase() === "true") return false;`,
-  `function localToolUnavailable(toolName) {\n  if (!process.env.FIRECRAWL_API_URL) return false;\n  if (toolName === "firecrawl_extract") return true;\n  if ((process.env.FIRECRAWL_SELF_HOSTED_DB_ENABLED || "").toLowerCase() === "true") return false;`,
+  `function localToolUnavailable(toolName) {\n  if (!process.env.FIRECRAWL_API_URL) return false;\n  if (toolName === "firecrawl_extract") return true;\n  if ((process.env.FIRECRAWL_SELF_HOSTED_DB_ENABLED || "").toLowerCase() !== "false") return false;`,
+);
+
+// Older patch revisions could leave more than one capability declaration.
+// Remove every generated copy before inserting the single canonical block.
+source = source.replace(
+  /\nvar LOCAL_UNSUPPORTED_TOOL_NAMES = \/\* @__PURE__ \*\/ new Set\(\[[\s\S]*?\n\]\);\nfunction localToolUnavailable\(toolName\) \{[\s\S]*?\n\}/g,
+  "",
 );
 
 function replaceOnce(oldText, newText, label) {
@@ -34,7 +41,7 @@ function replaceOnce(oldText, newText, label) {
 
 replaceOnce(
   `var KEYLESS_TOOL_NAMES = /* @__PURE__ */ new Set([\n  "firecrawl_scrape",\n  "firecrawl_search",\n  "firecrawl_parse"\n]);`,
-  `var KEYLESS_TOOL_NAMES = /* @__PURE__ */ new Set([\n  "firecrawl_scrape",\n  "firecrawl_search",\n  "firecrawl_parse"\n]);\nvar LOCAL_UNSUPPORTED_TOOL_NAMES = /* @__PURE__ */ new Set([\n  "firecrawl_extract",\n  "firecrawl_feedback",\n  "firecrawl_search_feedback",\n  "firecrawl_interact",\n  "firecrawl_interact_stop"\n]);\nfunction localToolUnavailable(toolName) {\n  if (!process.env.FIRECRAWL_API_URL) return false;\n  if (toolName === "firecrawl_extract") return true;\n  if ((process.env.FIRECRAWL_SELF_HOSTED_DB_ENABLED || "").toLowerCase() === "true") return false;\n  return LOCAL_UNSUPPORTED_TOOL_NAMES.has(toolName) || toolName.startsWith("firecrawl_monitor_");\n}`,
+  `var KEYLESS_TOOL_NAMES = /* @__PURE__ */ new Set([\n  "firecrawl_scrape",\n  "firecrawl_search",\n  "firecrawl_parse"\n]);\nvar LOCAL_UNSUPPORTED_TOOL_NAMES = /* @__PURE__ */ new Set([\n  "firecrawl_extract",\n  "firecrawl_feedback",\n  "firecrawl_search_feedback",\n  "firecrawl_interact",\n  "firecrawl_interact_stop"\n]);\nfunction localToolUnavailable(toolName) {\n  if (!process.env.FIRECRAWL_API_URL) return false;\n  if (toolName === "firecrawl_extract") return true;\n  if ((process.env.FIRECRAWL_SELF_HOSTED_DB_ENABLED || "").toLowerCase() !== "false") return false;\n  return LOCAL_UNSUPPORTED_TOOL_NAMES.has(toolName) || toolName.startsWith("firecrawl_monitor_");\n}`,
   "local database capability declaration",
 );
 

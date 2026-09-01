@@ -206,6 +206,7 @@ configuration; merge its `mcp.firecrawl` entry into the active file:
       "command": ["npx", "-y", "firecrawl-mcp@3.22.2"],
       "environment": {
         "FIRECRAWL_API_URL": "http://localhost:3002",
+        "FIRECRAWL_SELF_HOSTED_DB_ENABLED": "true",
         "FIRECRAWL_MCP_MAX_OUTPUT_CHARS": "400000"
       }
     }
@@ -407,7 +408,9 @@ If 0 results, SearXNG engines may be blocked. Edit `searxng/settings.yml` to add
 4. Restart opencode again
 
 ### Database or interact state is missing
-Run the idempotent schema repair against the running stack:
+Confirm the MCP process has `FIRECRAWL_SELF_HOSTED_DB_ENABLED=true`; this makes
+the durable monitor, feedback, and interact tools visible. Then run the
+idempotent schema repair against the running stack:
 ```bash
 ./init-db.sh
 ```

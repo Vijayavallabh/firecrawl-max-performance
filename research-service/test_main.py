@@ -21,10 +21,24 @@ from main import (  # noqa: E402
     oa_to_result,
     parse_paper_reference,
     rank_passages,
+    similarity_semantic_score,
 )
 
 
 class ResearchHelpersTest(unittest.TestCase):
+    def test_related_paper_semantics_reject_unrelated_syndrome_noise(self):
+        intent = "causal genes and mechanisms of mosaic variegated aneuploidy syndrome"
+        relevant = {
+            "title": "Biallelic TRIP13 mutations predispose to chromosome missegregation",
+            "abstract": "Mosaic variegated aneuploidy caused by a spindle checkpoint defect.",
+        }
+        unrelated = {
+            "title": "A novel ZNF699 mutation in DEGCAGS syndrome",
+            "abstract": "An immunological characterization of B cell depletion.",
+        }
+        self.assertGreater(similarity_semantic_score(relevant, intent), 1)
+        self.assertEqual(similarity_semantic_score(unrelated, intent), 0)
+
     def test_identifier_parser_accepts_supported_reference_forms(self):
         cases = {
             "arxiv:1706.03762v1": "arxiv:1706.03762v1",

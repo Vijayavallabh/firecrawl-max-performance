@@ -15,27 +15,23 @@ command -v node >/dev/null 2>&1 || {
   exit 1
 }
 
-MCP_JS=""
-for cache_root in "${HOME:-/home}/.npm" "${HOME:-/home}/.cache" "${HOME:-/home}/.local" /usr/local/lib/node_modules; do
-  if [ -d "$cache_root" ]; then
-    MCP_JS=$(find "$cache_root" -path "*/firecrawl-mcp/dist/index.js" -print -quit 2>/dev/null || true)
-  fi
-  [ -n "$MCP_JS" ] && break
-done
+mapfile -t MCP_BUNDLES < <(
+  for cache_root in "${HOME:-/home}/.npm" "${HOME:-/home}/.cache" "${HOME:-/home}/.local" /usr/local/lib/node_modules; do
+    [ -d "$cache_root" ] && find "$cache_root" -path "*/firecrawl-mcp/dist/index.js" -print 2>/dev/null
+  done | sort -u
+)
 
-if [ -z "$MCP_JS" ]; then
+if [ "${#MCP_BUNDLES[@]}" -eq 0 ]; then
   echo "firecrawl-mcp not found in the npm cache."
   echo "Install it first with: npx -y firecrawl-mcp@3.22.2"
   exit 1
 fi
 
-SDK_JS=""
-for cache_root in "${HOME:-/home}/.npm" "${HOME:-/home}/.cache" "${HOME:-/home}/.local" /usr/local/lib/node_modules; do
-  if [ -d "$cache_root" ]; then
-    SDK_JS=$(find "$cache_root" -path "*/@mendable/firecrawl-js/dist/index.js" -print -quit 2>/dev/null || true)
-  fi
-  [ -n "$SDK_JS" ] && break
+for MCP_JS in "${MCP_BUNDLES[@]}"; do
+  NODE_MODULES_DIR=$(dirname "$(dirname "$(dirname "$MCP_JS")")")
+  SDK_JS="$NODE_MODULES_DIR/@mendable/firecrawl-js/dist/index.js"
+  [ -f "$SDK_JS" ] || SDK_JS=""
+  node "$SCRIPT_DIR/patch-mcp.js" "$MCP_JS" "$SDK_JS"
+  node "$SCRIPT_DIR/scripts/patch-mcp-reliability.mjs" "$MCP_JS"
 done
-
-node "$SCRIPT_DIR/patch-mcp.js" "$MCP_JS" "$SDK_JS"
 echo "Restart opencode for the patched tool schemas to take effect."
