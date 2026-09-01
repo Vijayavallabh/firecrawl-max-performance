@@ -412,10 +412,13 @@ echo "[5/10] Copying research-service into Firecrawl apps directory..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -d "$SCRIPT_DIR/research-service" ]; then
   mkdir -p "$FIRECRAWL_DIR/apps/research-service"
+  mkdir -p "$FIRECRAWL_DIR/config"
   for file in Dockerfile requirements.txt main.py test_main.py; do
     require_file "$SCRIPT_DIR/research-service/$file"
     cp -f "$SCRIPT_DIR/research-service/$file" "$FIRECRAWL_DIR/apps/research-service/$file"
   done
+  require_file "$SCRIPT_DIR/config/empty-cookies.txt"
+  cp -f "$SCRIPT_DIR/config/empty-cookies.txt" "$FIRECRAWL_DIR/config/empty-cookies.txt"
   echo "  Copied to $FIRECRAWL_DIR/apps/research-service"
 else
   echo "  WARNING: research-service directory not found alongside this script."
@@ -505,7 +508,7 @@ sed -i 's/HARNESS_STARTUP_TIMEOUT_MS: ${HARNESS_STARTUP_TIMEOUT_MS:-60000}/HARNE
 
 # Add SearXNG + research-service services and searxng volume if not present
 if ! grep -q "  searxng:" "$COMPOSE"; then
-    sed -i '/^networks:/i\  searxng:\n    image: searxng/searxng@sha256:11a9b34cdc0b1ec2b991470a2762ecb5a1a531898289fb51dcd015260450729e\n    environment:\n      - SEARXNG_BASE_URL=http://searxng:8080\n      - SEARXNG_SECRET=${SEARXNG_SECRET}\n    networks:\n      - backend\n    volumes:\n      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro\n    logging:\n      driver: "json-file"\n      options:\n        max-size: "5m"\n        max-file: "2"\n        compress: "true"\n\n  research-service:\n    build: apps/research-service\n    environment:\n      S2_API_KEY: ${S2_API_KEY}\n      GITHUB_TOKEN: ${GITHUB_TOKEN}\n      MAILTO: ${MAILTO:-research@firecrawl.local}\n    networks:\n      - backend\n    mem_limit: 16G\n    memswap_limit: 16G\n    logging:\n      driver: "json-file"\n      options:\n        max-size: "5m"\n        max-file: "2"\n        compress: "true"\n' "$COMPOSE"
+    sed -i '/^networks:/i\  searxng:\n    image: searxng/searxng@sha256:11a9b34cdc0b1ec2b991470a2762ecb5a1a531898289fb51dcd015260450729e\n    environment:\n      - SEARXNG_BASE_URL=http://searxng:8080\n      - SEARXNG_SECRET=${SEARXNG_SECRET}\n    networks:\n      - backend\n    volumes:\n      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro\n    logging:\n      driver: "json-file"\n      options:\n        max-size: "5m"\n        max-file: "2"\n        compress: "true"\n\n  research-service:\n    build: apps/research-service\n    environment:\n      S2_API_KEY: ${S2_API_KEY}\n      GITHUB_TOKEN: ${GITHUB_TOKEN}\n      MAILTO: ${MAILTO:-research@firecrawl.local}\n      INSTITUTIONAL_ACCESS_ENABLED: ${INSTITUTIONAL_ACCESS_ENABLED:-false}\n      INSTITUTIONAL_COOKIE_FILE: /run/secrets/institutional_cookies\n      INSTITUTIONAL_ALLOWED_DOMAINS: ${INSTITUTIONAL_ALLOWED_DOMAINS:-}\n      INSTITUTIONAL_MAX_DOWNLOAD_BYTES: ${INSTITUTIONAL_MAX_DOWNLOAD_BYTES:-52428800}\n      INSTITUTIONAL_MAX_PDF_PAGES: ${INSTITUTIONAL_MAX_PDF_PAGES:-100}\n    networks:\n      - backend\n    mem_limit: 16G\n    memswap_limit: 16G\n    volumes:\n      - ${INSTITUTIONAL_COOKIE_FILE:-./config/empty-cookies.txt}:/run/secrets/institutional_cookies:ro\n    logging:\n      driver: "json-file"\n      options:\n        max-size: "5m"\n        max-file: "2"\n        compress: "true"\n' "$COMPOSE"
   sed -i '/^  fdb-cluster-file:/a\  searxng-data:' "$COMPOSE"
 fi
 

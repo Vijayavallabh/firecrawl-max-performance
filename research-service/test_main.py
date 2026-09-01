@@ -5,7 +5,11 @@ from unittest.mock import patch
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import httpx
+
 sys.path.insert(0, str(Path(__file__).parent))
+
+import main  # noqa: E402
 
 from main import (  # noqa: E402
     ARXIV_STOP_WORDS,
@@ -100,6 +104,67 @@ class ResearchHelpersTest(unittest.TestCase):
             if len(term) > 2 and term.lower() not in ARXIV_STOP_WORDS
         ]
         self.assertEqual(terms, ["api", "tool", "language", "agents"])
+
+
+class InstitutionalFullTextTests(unittest.TestCase):
+    def setUp(self):
+        self.original_domains = main.INSTITUTIONAL_ALLOWED_DOMAINS
+        main.INSTITUTIONAL_ALLOWED_DOMAINS = {"nature.com", "academic.oup.com"}
+
+    def tearDown(self):
+        main.INSTITUTIONAL_ALLOWED_DOMAINS = self.original_domains
+
+    def test_credentials_are_limited_to_allowlisted_publishers(self):
+        self.assertTrue(main.institutional_domain_allowed("https://www.nature.com/articles/example"))
+        self.assertTrue(main.institutional_domain_allowed("https://academic.oup.com/paper.pdf"))
+        self.assertFalse(main.institutional_domain_allowed("https://nature.com.attacker.test/paper"))
+        self.assertFalse(main.institutional_domain_allowed("https://doi.org/10.1/example"))
+
+    def test_discovers_standard_citation_pdf_metadata(self):
+        html = '<meta name="citation_pdf_url" content="/content/paper.pdf"><a href="supplement.txt">x</a>'
+        self.assertEqual(
+            main.publisher_pdf_links(html, "https://www.nature.com/article"),
+            ["https://www.nature.com/content/paper.pdf"],
+        )
+
+    def test_rejects_login_html_masquerading_as_a_pdf(self):
+        self.assertFalse(main.looks_like_pdf(b"<html>institutional login</html>", "text/html"))
+        self.assertTrue(main.looks_like_pdf(b"%PDF-1.7 fixture", "application/pdf"))
+
+
+class BoundedFetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cookie_is_sent_only_to_allowlisted_domain(self):
+        original_domains = main.INSTITUTIONAL_ALLOWED_DOMAINS
+        main.INSTITUTIONAL_ALLOWED_DOMAINS = {"nature.com"}
+        seen = []
+
+        async def handler(request):
+            seen.append((request.url.host, request.headers.get("cookie")))
+            return httpx.Response(200, content=b"%PDF-fixture", headers={"content-type": "application/pdf"})
+
+        cookies = httpx.Cookies()
+        cookies.set("session", "fixture", domain="nature.com", path="/")
+        try:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                with patch.object(main, "institutional_cookies", return_value=cookies):
+                    await main.bounded_get(client, "https://nature.com/paper", use_institutional_cookies=True)
+                    await main.bounded_get(client, "https://attacker.test/paper", use_institutional_cookies=True)
+        finally:
+            main.INSTITUTIONAL_ALLOWED_DOMAINS = original_domains
+
+        self.assertEqual(seen, [("nature.com", "session=fixture"), ("attacker.test", None)])
+
+    async def test_declared_oversize_response_is_not_downloaded(self):
+        async def handler(request):
+            return httpx.Response(
+                200,
+                content=b"not consumed",
+                headers={"content-length": str(main.INSTITUTIONAL_MAX_DOWNLOAD_BYTES + 1)},
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            content, _, _ = await main.bounded_get(client, "https://example.org/large.pdf")
+        self.assertEqual(content, b"")
 
 
 if __name__ == "__main__":

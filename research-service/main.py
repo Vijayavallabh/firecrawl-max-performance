@@ -8,8 +8,10 @@ import asyncio
 import base64
 import time
 from difflib import SequenceMatcher
+from http.cookiejar import MozillaCookieJar
+from html.parser import HTMLParser
 import xml.etree.ElementTree as ET
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 from typing import Any, Optional, List
 
 app = FastAPI(title="Firecrawl Research Proxy")
@@ -24,7 +26,13 @@ EUROPEPMC_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 MAILTO = os.environ.get("MAILTO", "research@firecrawl.local")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 S2_API_KEY = os.environ.get("S2_API_KEY", "")
-
+INSTITUTIONAL_ACCESS_ENABLED = os.environ.get("INSTITUTIONAL_ACCESS_ENABLED", "false").lower() == "true"
+INSTITUTIONAL_COOKIE_FILE = os.environ.get("INSTITUTIONAL_COOKIE_FILE", "/run/secrets/institutional_cookies")
+INSTITUTIONAL_ALLOWED_DOMAINS = {
+    value.strip().lower()
+    for value in os.environ.get("INSTITUTIONAL_ALLOWED_DOMAINS", "").split(",")
+    if value.strip()
+}
 TIMEOUT = 300.0
 
 
@@ -40,6 +48,10 @@ PAPER_SEARCH_MAX_PAGES = bounded_env_number("PAPER_SEARCH_MAX_PAGES", 10, 1, 50,
 PAPER_SEARCH_SCAN_TIMEOUT_SECONDS = bounded_env_number(
     "PAPER_SEARCH_SCAN_TIMEOUT_SECONDS", 90.0, 1.0, 300.0, float
 )
+INSTITUTIONAL_MAX_DOWNLOAD_BYTES = bounded_env_number(
+    "INSTITUTIONAL_MAX_DOWNLOAD_BYTES", 50 * 1024 * 1024, 1024, 500 * 1024 * 1024, int
+)
+INSTITUTIONAL_MAX_PDF_PAGES = bounded_env_number("INSTITUTIONAL_MAX_PDF_PAGES", 100, 1, 1000, int)
 
 BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 ARXIV_STOP_WORDS = {
@@ -51,6 +63,94 @@ ARXIV_ID_RE = re.compile(
     r"^(?:\d{4}\.\d{4,5}(?:v\d+)?|[a-z][a-z0-9.-]+/\d{7}(?:v\d+)?)$",
     re.I,
 )
+
+
+def institutional_domain_allowed(url: str) -> bool:
+    """Allow credential-bearing requests only to explicitly configured publishers."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return bool(host) and any(
+        host == domain or host.endswith(f".{domain}")
+        for domain in INSTITUTIONAL_ALLOWED_DOMAINS
+    )
+
+
+def institutional_cookies() -> httpx.Cookies:
+    cookies = httpx.Cookies()
+    if not INSTITUTIONAL_ACCESS_ENABLED or not os.path.isfile(INSTITUTIONAL_COOKIE_FILE):
+        return cookies
+    jar = MozillaCookieJar(INSTITUTIONAL_COOKIE_FILE)
+    try:
+        jar.load(ignore_discard=True, ignore_expires=False)
+    except (OSError, ValueError):
+        return cookies
+    for cookie in jar:
+        cookies.set(cookie.name, cookie.value, domain=cookie.domain, path=cookie.path or "/")
+    return cookies
+
+
+class PdfLinkParser(HTMLParser):
+    def __init__(self, base_url: str):
+        super().__init__()
+        self.base_url = base_url
+        self.urls: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]):
+        values = {key.lower(): value for key, value in attrs if value}
+        if (
+            tag.lower() == "meta"
+            and values.get("name", "").lower() == "citation_pdf_url"
+            and values.get("content")
+        ):
+            self.urls.append(urljoin(self.base_url, values["content"]))
+        elif tag.lower() == "a" and "pdf" in values.get("href", "").lower():
+            self.urls.append(urljoin(self.base_url, values["href"]))
+
+
+def publisher_pdf_links(html: str, base_url: str) -> list[str]:
+    parser = PdfLinkParser(base_url)
+    parser.feed(html[:2_000_000])
+    return list(dict.fromkeys(parser.urls))
+
+
+def looks_like_pdf(content: bytes, content_type: str = "") -> bool:
+    return content.lstrip().startswith(b"%PDF-") and (
+        not content_type
+        or "pdf" in content_type.lower()
+        or "octet-stream" in content_type.lower()
+    )
+
+
+async def bounded_get(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    use_institutional_cookies: bool = False,
+) -> tuple[bytes, str, str]:
+    cookies = (
+        institutional_cookies()
+        if use_institutional_cookies and institutional_domain_allowed(url)
+        else None
+    )
+    async with client.stream("GET", url, headers={"User-Agent": BROWSER_UA}, cookies=cookies) as response:
+        content_type = response.headers.get("content-type", "")
+        final_url = str(response.url)
+        if response.status_code != 200:
+            return b"", content_type, final_url
+        try:
+            declared = int(response.headers.get("content-length", "0") or 0)
+        except ValueError:
+            declared = 0
+        if declared > INSTITUTIONAL_MAX_DOWNLOAD_BYTES:
+            return b"", content_type, final_url
+        chunks = bytearray()
+        async for chunk in response.aiter_bytes():
+            chunks.extend(chunk)
+            if len(chunks) > INSTITUTIONAL_MAX_DOWNLOAD_BYTES:
+                return b"", content_type, final_url
+        return bytes(chunks), content_type, final_url
 
 
 def normalize_title(value: Optional[str]) -> str:
@@ -1854,15 +1954,15 @@ async def developer_search(
 
 async def find_passages(result: dict, work: dict, question: str, num_passages: int) -> list:
     arxiv_id = get_arxiv_id_from_ids(result.get("ids", {}))
-    pdf_url = None
+    pdf_urls: list[str] = []
 
     open_access = work.get("open_access") or {}
     oa_url = open_access.get("oa_url")
     if oa_url and "arxiv.org" in oa_url:
-        pdf_url = oa_url.replace("/abs/", "/pdf/") + ".pdf"
+        pdf_urls.append(oa_url.replace("/abs/", "/pdf/") + ".pdf")
 
-    if not pdf_url and arxiv_id:
-        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    if arxiv_id:
+        pdf_urls.append(f"https://arxiv.org/pdf/{arxiv_id}.pdf")
 
     # Try Europe PMC full-text XML if PMCID is available
     pmcid = None
@@ -1874,8 +1974,18 @@ async def find_passages(result: dict, work: dict, question: str, num_passages: i
         pmcid = ids["pmcid"][0]
     elif ids.get("PMCID"):
         pmcid = ids["PMCID"][0]
+    if not pmcid:
+        pmc_candidates = [open_access.get("oa_url") or ""] + [
+            location.get("landing_page_url") or ""
+            for location in work.get("locations") or []
+        ]
+        for candidate in pmc_candidates:
+            match = re.search(r"(?:PMC|/pmc/articles/)(\d+)", candidate, re.IGNORECASE)
+            if match:
+                pmcid = f"PMC{match.group(1)}"
+                break
 
-    if pmcid and not pdf_url:
+    if pmcid and not pdf_urls:
         try:
             async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
                 resp = await client.get(f"{EUROPEPMC_BASE}/{pmcid}/fullTextXML")
@@ -1891,16 +2001,14 @@ async def find_passages(result: dict, work: dict, question: str, num_passages: i
             print(f"Europe PMC full-text error: {e}")
 
     # Try OpenAlex best_oa_location or locations PDFs
-    if not pdf_url:
-        locations = work.get("locations") or []
-        for loc in locations:
-            pdf = loc.get("pdf_url")
-            if pdf and pdf.endswith(".pdf"):
-                pdf_url = pdf
-                break
+    locations = work.get("locations") or []
+    for loc in locations:
+        pdf = loc.get("pdf_url")
+        if pdf:
+            pdf_urls.append(pdf)
 
     # Try Semantic Scholar openAccessPdf
-    if not pdf_url:
+    if not pdf_urls:
         paper_id_for_s2 = result.get("primaryId", "")
         if paper_id_for_s2:
             try:
@@ -1913,37 +2021,66 @@ async def find_passages(result: dict, work: dict, question: str, num_passages: i
                 if s2_resp.status_code == 200:
                     oa_pdf = s2_resp.json().get("openAccessPdf")
                     if oa_pdf and oa_pdf.get("url"):
-                        pdf_url = oa_pdf["url"]
+                        pdf_urls.append(oa_pdf["url"])
             except Exception:
                 pass
 
-    if not pdf_url:
-        return []
+    # DOI pages often advertise a citation_pdf_url even when bibliographic APIs
+    # omit it. Credentials are never sent to doi.org and are used only after a
+    # redirect has landed on an explicitly allowlisted publisher domain.
+    primary_id = result.get("primaryId", "")
+    if primary_id.lower().startswith("doi:"):
+        doi_url = f"https://doi.org/{primary_id[4:]}"
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+                landing, content_type, final_url = await bounded_get(client, doi_url)
+                if landing and "html" in content_type.lower():
+                    pdf_urls.extend(
+                        publisher_pdf_links(landing.decode("utf-8", errors="ignore"), final_url)
+                    )
+                if INSTITUTIONAL_ACCESS_ENABLED and institutional_domain_allowed(final_url):
+                    landing, content_type, final_url = await bounded_get(
+                        client, final_url, use_institutional_cookies=True
+                    )
+                    if landing and "html" in content_type.lower():
+                        pdf_urls.extend(
+                            publisher_pdf_links(landing.decode("utf-8", errors="ignore"), final_url)
+                        )
+        except Exception as e:
+            print(f"DOI landing-page discovery error: {e}")
 
-    try:
-        async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as client:
-            resp = await client.get(pdf_url, headers={"User-Agent": BROWSER_UA})
-        if resp.status_code != 200:
-            return []
+    for pdf_url in dict.fromkeys(pdf_urls):
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+                content, content_type, final_url = await bounded_get(
+                    client,
+                    pdf_url,
+                    use_institutional_cookies=INSTITUTIONAL_ACCESS_ENABLED,
+                )
+            if not looks_like_pdf(content, content_type):
+                continue
 
-        from PyPDF2 import PdfReader
-        reader = PdfReader(io.BytesIO(resp.content))
-        full_text = ""
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                full_text += text + "\n"
+            from PyPDF2 import PdfReader
+            reader = PdfReader(io.BytesIO(content))
+            full_text = ""
+            for page in reader.pages[:INSTITUTIONAL_MAX_PDF_PAGES]:
+                text = page.extract_text()
+                if text:
+                    full_text += text + "\n"
 
-        if not full_text.strip():
-            return []
+            if not full_text.strip():
+                continue
 
-        passages = split_into_passages(full_text)
-        ranked = rank_passages(passages, question)
-        top = ranked[:num_passages]
-        return [{"text": p, "score": score} for score, p in top]
-    except Exception as e:
-        print(f"Error extracting passages: {e}")
-        return []
+            passages = split_into_passages(full_text)
+            ranked = rank_passages(passages, question)
+            top = ranked[:num_passages]
+            return [
+                {"text": passage, "score": score, "sourceUrl": final_url}
+                for score, passage in top
+            ]
+        except Exception as e:
+            print(f"Error extracting passages from {pdf_url}: {e}")
+    return []
 
 
 def split_into_passages(text: str, min_words: int = 50, max_words: int = 300) -> list:

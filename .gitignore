@@ -1,6 +1,10 @@
 .env
+config/institutional-cookies.txt
 firecrawl/
 *.pyc
 __pycache__/
 .DS_Store
 patches/
+!patches/
+patches/*
+!patches/reliability.patch

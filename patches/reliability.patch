@@ -1,0 +1,271 @@
+diff --git a/apps/api/src/controllers/v2/crawl-status.ts b/apps/api/src/controllers/v2/crawl-status.ts
+index 54d0533..10d77d7 100644
+--- a/apps/api/src/controllers/v2/crawl-status.ts
++++ b/apps/api/src/controllers/v2/crawl-status.ts
+@@ -241,7 +241,7 @@ export async function crawlStatusController(
+       (numericStats.active ?? 0) +
+       (numericStats.queued ?? 0) +
+       (numericStats.backlog ?? 0),
+-    creditsUsed: creditsBilled?.[0]?.credits_billed ?? -1,
++    creditsUsed: creditsBilled?.[0]?.credits_billed ?? 0,
+   };
+ 
+   // if the crawl has a stored error and no jobs were ever created, mark as failed
+diff --git a/apps/api/src/controllers/v2/search.ts b/apps/api/src/controllers/v2/search.ts
+index 47dfb6f..9af6bd5 100644
+--- a/apps/api/src/controllers/v2/search.ts
++++ b/apps/api/src/controllers/v2/search.ts
+@@ -379,6 +379,18 @@ export async function searchController(
+       });
+     }
+ 
++    if (
++      error instanceof Error &&
++      "code" in error &&
++      error.code === "SEARCH_PROVIDERS_UNAVAILABLE"
++    ) {
++      return res.status(503).json({
++        success: false,
++        code: "SEARCH_PROVIDERS_UNAVAILABLE",
++        error: error.message,
++      });
++    }
++
+     if (error instanceof ScrapeJobTimeoutError) {
+       return res.status(408).json({
+         success: false,
+diff --git a/apps/api/src/lib/error.ts b/apps/api/src/lib/error.ts
+index 55126cfb..895937eb 100644
+--- a/apps/api/src/lib/error.ts
++++ b/apps/api/src/lib/error.ts
+@@ -33,6 +33,7 @@ export type ErrorCodes =
+   | "PARSE_UNSUPPORTED_OPTIONS"
+   | "CRAWL_DENIAL"
+   | "MAP_FAILED"
++  | "SEARCH_PROVIDERS_UNAVAILABLE"
+   | "BAD_REQUEST_INVALID_JSON"
+   | "BAD_REQUEST"
+   // Threat protection (enterprise domain risk blocking). Lowercase by design:
+diff --git a/apps/api/src/lib/error-serde.ts b/apps/api/src/lib/error-serde.ts
+index 58922ed8..af7bccfb 100644
+--- a/apps/api/src/lib/error-serde.ts
++++ b/apps/api/src/lib/error-serde.ts
+@@ -65,5 +65,7 @@ const errorMap: Record<ErrorCodes, any> = {
+   SCRAPE_X_TWITTER_CONFIGURATION_ERROR: XTwitterConfigurationError,
+   MAP_FAILED: MapFailedError,
++  // Search provider outages are handled synchronously by the HTTP controller.
++  SEARCH_PROVIDERS_UNAVAILABLE: null,
+   unsafe_domain_blocked: UnsafeDomainBlockedError,
+ 
+   // Zod errors
+diff --git a/apps/api/src/scraper/scrapeURL/error.ts b/apps/api/src/scraper/scrapeURL/error.ts
+index 1e28043..53063aa 100644
+--- a/apps/api/src/scraper/scrapeURL/error.ts
++++ b/apps/api/src/scraper/scrapeURL/error.ts
+@@ -450,7 +450,7 @@ export class DocumentAntibotError extends TransportableError {
+   constructor() {
+     super(
+       "SCRAPE_DOCUMENT_ANTIBOT_ERROR",
+-      "Document scrape was prevented by anti-bot",
++      "Page or document scrape was prevented by an anti-bot or access-verification interstitial",
+     );
+   }
+ 
+diff --git a/apps/api/src/scraper/scrapeURL/index.ts b/apps/api/src/scraper/scrapeURL/index.ts
+index cc53ac8..45fbb23 100644
+--- a/apps/api/src/scraper/scrapeURL/index.ts
++++ b/apps/api/src/scraper/scrapeURL/index.ts
+@@ -1284,6 +1284,7 @@ export async function scrapeURL(
+             }
+           } else if (
+             error instanceof DocumentAntibotError &&
++            meta.featureFlags.has("document") &&
+             meta.internalOptions.forceEngine === undefined
+           ) {
+             if (meta.documentPrefetch !== undefined) {
+diff --git a/apps/api/src/scraper/scrapeURL/transformers/index.ts b/apps/api/src/scraper/scrapeURL/transformers/index.ts
+index 2df9b5d..e7a8ca0 100644
+--- a/apps/api/src/scraper/scrapeURL/transformers/index.ts
++++ b/apps/api/src/scraper/scrapeURL/transformers/index.ts
+@@ -30,6 +30,7 @@ import { hasFormatOfType } from "../../../lib/format-utils";
+ import { brandingTransformer } from "../../../lib/branding/transformer";
+ import { indexerQueue } from "../../../services/indexing/indexer-queue";
+ import { config } from "../../../config";
++import { rejectAccessInterstitial } from "./rejectAccessInterstitial";
+ 
+ type Transformer = (
+   meta: Meta,
+@@ -640,6 +641,7 @@ const transformerStack: Transformer[] = [
+   deriveImagesFromHTML,
+   deriveBrandingFromActions,
+   deriveMetadataFromRawHTML,
++  rejectAccessInterstitial,
+   fetchProduct,
+   fetchMenu,
+   ...(useIndex ? [sendDocumentToIndex] : []),
+diff --git a/apps/api/src/search/v2/index.ts b/apps/api/src/search/v2/index.ts
+index 271e5d4..bb18922 100644
+--- a/apps/api/src/search/v2/index.ts
++++ b/apps/api/src/search/v2/index.ts
+@@ -5,6 +5,15 @@ import { searxng_search } from "./searxng";
+ import { ddgSearch } from "./ddgsearch";
+ import { Logger } from "winston";
+ 
++export class SearchProvidersUnavailableError extends Error {
++  readonly code = "SEARCH_PROVIDERS_UNAVAILABLE";
++
++  constructor(readonly providers: string[]) {
++    super(`Search providers unavailable: ${providers.join(", ")}`);
++    this.name = "SearchProvidersUnavailableError";
++  }
++}
++
+ export async function search({
+   query,
+   logger,
+@@ -38,8 +47,9 @@ export async function search({
+   type?: SearchResultType | SearchResultType[];
+   enterprise?: ("default" | "anon" | "zdr")[];
+ }): Promise<SearchV2Response> {
+-  try {
+-    if (config.FIRE_ENGINE_BETA_URL) {
++  const providerFailures: string[] = [];
++  if (config.FIRE_ENGINE_BETA_URL) {
++    try {
+       logger.info("Using fire engine search");
+       const results = await fire_engine_search_v2(query, {
+         numResults: num_results,
+@@ -54,9 +64,14 @@ export async function search({
+       });
+ 
+       return results;
++    } catch (error) {
++      providerFailures.push("fire-engine");
++      logger.error("Fire engine search failed", { error });
+     }
++  }
+ 
+-    if (config.SEARXNG_ENDPOINT) {
++  if (config.SEARXNG_ENDPOINT) {
++    try {
+       logger.info("Using searxng search");
+       const results = await searxng_search(query, {
+         num_results,
+@@ -68,8 +83,13 @@ export async function search({
+         safe,
+       });
+       if (results.web && results.web.length > 0) return results;
++    } catch (error) {
++      providerFailures.push("searxng");
++      logger.error("SearXNG search failed", { error });
+     }
++  }
+ 
++  try {
+     logger.info("Using DuckDuckGo search");
+     const ddgResults = await ddgSearch(query, num_results, {
+       tbs,
+@@ -79,11 +99,13 @@ export async function search({
+       timeout,
+     });
+     if (ddgResults.web && ddgResults.web.length > 0) return ddgResults;
+-
+-    // Fallback to empty response
+-    return {};
+   } catch (error) {
+-    logger.error(`Error in search function`, { error });
+-    return {};
++    providerFailures.push("duckduckgo");
++    logger.error("DuckDuckGo search failed", { error });
++  }
++
++  if (providerFailures.length > 0) {
++    throw new SearchProvidersUnavailableError(providerFailures);
+   }
++  return {};
+ }
+diff --git a/apps/api/src/search/v2/searxng.ts b/apps/api/src/search/v2/searxng.ts
+index 16661a8..09c6b37 100644
+--- a/apps/api/src/search/v2/searxng.ts
++++ b/apps/api/src/search/v2/searxng.ts
+@@ -90,6 +90,6 @@ export async function searxng_search(
+       : {};
+   } catch (error) {
+     logger.error(`There was an error searching for content`, { error });
+-    return {};
++    throw error;
+   }
+ }
+
+diff --git a/apps/api/src/scraper/scrapeURL/transformers/rejectAccessInterstitial.ts b/apps/api/src/scraper/scrapeURL/transformers/rejectAccessInterstitial.ts
+new file mode 100644
+index 0000000..c54a64a
+--- /dev/null
++++ b/apps/api/src/scraper/scrapeURL/transformers/rejectAccessInterstitial.ts
+@@ -0,0 +1,36 @@
++import { Document } from "../../../controllers/v2/types";
++import { Meta } from "..";
++import { DocumentAntibotError } from "../error";
++
++const ACCESS_INTERSTITIAL_MARKERS = [
++  /checking your browser before accessing/i,
++  /recaptcha\/(?:api|challengepage)/i,
++  /verify (?:that )?you are (?:a )?human/i,
++  /cf-chl-(?:challenge|widget)/i,
++  /attention required\s*!?\s*cloudflare/i,
++  /enable javascript and cookies to continue/i,
++];
++
++export function isAccessInterstitial(document: Document): boolean {
++  const text = [
++    document.metadata?.title,
++    document.markdown,
++    document.html,
++    document.rawHtml,
++  ]
++    .filter((value): value is string => typeof value === "string")
++    .join("\n")
++    .slice(0, 50_000);
++
++  // Avoid rejecting real articles that merely discuss CAPTCHA systems.
++  if (text.length > 25_000) return false;
++  return ACCESS_INTERSTITIAL_MARKERS.some(pattern => pattern.test(text));
++}
++
++export async function rejectAccessInterstitial(
++  _meta: Meta,
++  document: Document,
++): Promise<Document> {
++  if (isAccessInterstitial(document)) throw new DocumentAntibotError();
++  return document;
++}
+
+diff --git a/apps/api/src/scraper/scrapeURL/transformers/rejectAccessInterstitial.test.ts b/apps/api/src/scraper/scrapeURL/transformers/rejectAccessInterstitial.test.ts
+new file mode 100644
+index 0000000..0d25ded
+--- /dev/null
++++ b/apps/api/src/scraper/scrapeURL/transformers/rejectAccessInterstitial.test.ts
+@@ -0,0 +1,23 @@
++import { describe, expect, it } from "vitest";
++import { isAccessInterstitial } from "./rejectAccessInterstitial";
++
++describe("isAccessInterstitial", () => {
++  it("detects the NCBI browser verification page before LLM transforms", () => {
++    expect(
++      isAccessInterstitial({
++        markdown:
++          "Checking your browser before accessing www.ncbi.nlm.nih.gov ... Click here: https://www.google.com/recaptcha/challengepage/#",
++        metadata: { title: "Checking your browser - reCAPTCHA" },
++      } as any),
++    ).toBe(true);
++  });
++
++  it("does not reject a substantive article that discusses CAPTCHA", () => {
++    expect(
++      isAccessInterstitial({
++        markdown: `A long security article about reCAPTCHA. ${"substantive content ".repeat(2000)}`,
++        metadata: { title: "Bot detection research" },
++      } as any),
++    ).toBe(false);
++  });
++});

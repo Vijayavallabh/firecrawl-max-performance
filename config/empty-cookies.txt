@@ -1,0 +1,3 @@
+# Netscape HTTP Cookie File
+# Deliberately empty. Set INSTITUTIONAL_COOKIE_FILE in .env to a protected,
+# untracked cookie export after authenticating interactively through IITM IDP.

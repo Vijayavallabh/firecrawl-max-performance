@@ -22,4 +22,5 @@ nano .env
 #    `opencode mcp list`
 ```
 
-See `README.md` for full documentation, troubleshooting, and performance tuning.
+See `README.md` for full documentation, the tool capability matrix, optional
+IITM journal-access safeguards, troubleshooting, and performance tuning.

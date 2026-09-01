@@ -138,6 +138,23 @@ value. Do not commit `.env`.
 - `GITHUB_TOKEN` — GitHub personal access token (raises API limit from 60 to 5000 req/hr)
 - `MAILTO` — Your email (gives higher OpenAlex API rate limits)
 
+### Optional IITM institutional full-text access
+
+Institutional access is disabled by default. Authenticate interactively in a
+browser on the IITM network, then export only the required publisher cookies in
+Netscape cookie-jar format to `config/institutional-cookies.txt`. Never put
+credentials or cookie contents in `.env` or Git.
+
+```env
+INSTITUTIONAL_ACCESS_ENABLED=true
+INSTITUTIONAL_COOKIE_FILE=./config/institutional-cookies.txt
+```
+
+Cookie-bearing requests are restricted to `INSTITUTIONAL_ALLOWED_DOMAINS`.
+Downloads and PDF parsing are bounded by `INSTITUTIONAL_MAX_DOWNLOAD_BYTES` and
+`INSTITUTIONAL_MAX_PDF_PAGES`. Use this only in accordance with IITM and
+publisher license terms.
+
 **LLM Backend options:**
 - Fireworks AI (recommended): `OPENAI_BASE_URL=https://api.fireworks.ai/inference/v1`, `MODEL_NAME=accounts/fireworks/models/gpt-oss-120b`
 - Ollama (local, free): Uncomment the OLLAMA_* lines, set `MODEL_NAME=deepseek-r1:7b`

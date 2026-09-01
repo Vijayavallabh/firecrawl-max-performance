@@ -319,10 +319,17 @@ services:
       MAILTO: ${MAILTO:-research@firecrawl.local}
       PAPER_SEARCH_MAX_PAGES: ${PAPER_SEARCH_MAX_PAGES:-10}
       PAPER_SEARCH_SCAN_TIMEOUT_SECONDS: ${PAPER_SEARCH_SCAN_TIMEOUT_SECONDS:-90}
+      INSTITUTIONAL_ACCESS_ENABLED: ${INSTITUTIONAL_ACCESS_ENABLED:-false}
+      INSTITUTIONAL_COOKIE_FILE: /run/secrets/institutional_cookies
+      INSTITUTIONAL_ALLOWED_DOMAINS: ${INSTITUTIONAL_ALLOWED_DOMAINS:-}
+      INSTITUTIONAL_MAX_DOWNLOAD_BYTES: ${INSTITUTIONAL_MAX_DOWNLOAD_BYTES:-52428800}
+      INSTITUTIONAL_MAX_PDF_PAGES: ${INSTITUTIONAL_MAX_PDF_PAGES:-100}
     networks:
       - backend
     mem_limit: 16G
     memswap_limit: 16G
+    volumes:
+      - ${INSTITUTIONAL_COOKIE_FILE:-./config/empty-cookies.txt}:/run/secrets/institutional_cookies:ro
     logging:
       driver: "json-file"
       options:
