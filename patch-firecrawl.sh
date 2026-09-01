@@ -702,6 +702,9 @@ sed -i 's/record(costTracking, "askLlm", "groq", LIGHT_MODEL,/record(costTrackin
 if ! grep -q "MODEL_NAME_FAST" "$COMPOSE"; then
   sed -i '/MODEL_NAME: ${MODEL_NAME}/a\  MODEL_NAME_FAST: ${MODEL_NAME_FAST}' "$COMPOSE"
 fi
+if ! grep -q "EXTRACT_ANCHOR_MODEL:" "$COMPOSE"; then
+  sed -i '/MODEL_NAME_FAST: ${MODEL_NAME_FAST}/a\  EXTRACT_ANCHOR_MODEL: ${EXTRACT_ANCHOR_MODEL:-accounts/fireworks/models/deepseek-v4-flash-0731}\n  EXTRACT_LIGHT_MODEL: ${EXTRACT_LIGHT_MODEL:-accounts/fireworks/models/deepseek-v4-flash-0731}' "$COMPOSE"
+fi
 
 # Keep the fast path provider-neutral so an Ollama deployment does not silently
 # call the OpenAI-compatible remote endpoint. The helper still accepts an

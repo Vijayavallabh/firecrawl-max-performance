@@ -5,7 +5,7 @@ Complete self-hosting package for [Firecrawl](https://github.com/firecrawl/firec
 - **Self-hosted throughput** with explicit safety bounds and no hosted API quota
 - **Custom research service** (6 endpoints: search_papers, inspect_paper, read_paper, related_papers, search_github, developer_search)
 - **SearXNG** meta-search backend (Google + Bing + DuckDuckGo + Wikipedia)
-- **Dual LLM model strategy** — heavy model for extraction, fast model for schema generation, summaries, reranking, and codegen
+- **DeepSeek V4 Flash throughout** — one Fireworks model for extraction, summaries, reranking, and codegen
 - **DeepSeek-V4-Flash-0731** as default LLM (284B MoE, $0.14/1M tokens, 1M context, fast+cheap)
 - **Fireworks AI** as the LLM backend for JSON extraction (or any OpenAI-compatible API)
 - **Tuned Docker resources** (32 NuQ workers, 50 local concurrency, 20 browser sessions)
@@ -156,17 +156,14 @@ Downloads and PDF parsing are bounded by `INSTITUTIONAL_MAX_DOWNLOAD_BYTES` and
 publisher license terms.
 
 **LLM Backend options:**
-- Fireworks AI (recommended): `OPENAI_BASE_URL=https://api.fireworks.ai/inference/v1`, `MODEL_NAME=accounts/fireworks/models/gpt-oss-120b`
+- Fireworks AI (recommended): `OPENAI_BASE_URL=https://api.fireworks.ai/inference/v1`, `MODEL_NAME=accounts/fireworks/models/deepseek-v4-flash-0731`
 - Ollama (local, free): Uncomment the OLLAMA_* lines, set `MODEL_NAME=deepseek-r1:7b`
 - OpenAI: `OPENAI_BASE_URL=https://api.openai.com/v1`, `MODEL_NAME=gpt-4o-mini`
 
-**Dual-model setup (recommended for Fireworks AI):**
-- `MODEL_NAME` = heavy model for accurate structured data extraction (e.g. `gpt-oss-120b`)
-- `MODEL_NAME_FAST` = fast/cheap model for schema generation, summaries, reranking, codegen (e.g. `deepseek-v4-flash-0731`)
-- DeepSeek-V4-Flash-0731: 284B MoE, $0.14/1M tokens, low latency, 1M context, strong reasoning+coding
-- GPT-OSS-120B: 120B, good structured output — ideal for accurate data extraction
-- If `MODEL_NAME_FAST` is not set, all tasks use `MODEL_NAME` (single-model mode)
-- **Simplest setup**: set both to `deepseek-v4-flash-0731` — it handles both extraction and fast tasks well
+**Unified model setup (recommended for Fireworks AI):**
+- Set both `MODEL_NAME` and `MODEL_NAME_FAST` to `accounts/fireworks/models/deepseek-v4-flash-0731`.
+- Keeping both explicit prevents older environments from retaining GPT-OSS on one path.
+- If `MODEL_NAME_FAST` is omitted, fast tasks fall back to `MODEL_NAME`.
 
 ### Step 4: Build and start
 
@@ -303,30 +300,30 @@ Also adjust memory limits in `docker-compose.yaml`:
 
 ## How It Works
 
-### Dual-Model Architecture
+### Model routing
 
-Firecrawl uses LLM models for different tasks. Not all tasks need the same model power. This setup uses two models strategically:
+Firecrawl retains separate heavy/fast routing hooks, but this setup points both to DeepSeek V4 Flash:
 
 | Task | Model | Why |
 |------|-------|-----|
-| JSON extraction (scrape `json` format) | **gpt-oss-120b** (heavy) | Needs accurate structured output |
-| Extract API (Fire-0 batch/single) | **gpt-oss-120b** (heavy) | Needs accurate data extraction |
-| Extract schema analysis | **gpt-oss-120b** (heavy) | Complex schema understanding |
-| Deep research final analysis | **gpt-oss-120b** (heavy) | Complex reasoning for final report |
-| Change tracking with schema | **gpt-oss-120b** (heavy) | Structured extraction from both versions |
-| Schema generation from prompt | **deepseek-v4-flash** (fast) | Simple JSON generation, high volume |
-| Summary generation | **deepseek-v4-flash** (fast) | Text summarization, high volume |
-| Clean content classification | **deepseek-v4-flash** (fast) | Binary decision, fast |
-| Crawler options generation | **deepseek-v4-flash** (fast) | Simple JSON |
-| Extract "should extract" check | **deepseek-v4-flash** (fast) | Binary classification |
-| URL reranking | **deepseek-v4-flash** (fast) | Ranking, high volume |
-| URL processor / basic completions | **deepseek-v4-flash** (fast) | Simple text |
-| Deep research query generation + planning | **deepseek-v4-flash** (fast) | Generating search queries |
-| llms.txt generation | **deepseek-v4-flash** (fast) | Titles/descriptions, high volume |
-| Engine picker | **deepseek-v4-flash** (fast) | Evaluating scrape quality |
-| Change tracking LLM diff | **deepseek-v4-flash** (fast) | Text comparison |
-| Deterministic JSON codegen | **deepseek-v4-flash** (fast) | **Coding is deepseek's specialty** |
-| Deterministic JSON askLlm | **deepseek-v4-flash** (fast) | Field value extraction |
+| JSON extraction (scrape `json` format) | **deepseek-v4-flash-0731** | Structured output |
+| Extract API (Fire-0 batch/single) | **deepseek-v4-flash-0731** | Data extraction |
+| Extract schema analysis | **deepseek-v4-flash-0731** | Schema understanding |
+| Deep research final analysis | **deepseek-v4-flash-0731** | Final synthesis |
+| Change tracking with schema | **deepseek-v4-flash-0731** | Structured comparison |
+| Schema generation from prompt | **deepseek-v4-flash-0731** | Simple JSON generation, high volume |
+| Summary generation | **deepseek-v4-flash-0731** | Text summarization, high volume |
+| Clean content classification | **deepseek-v4-flash-0731** | Binary decision, fast |
+| Crawler options generation | **deepseek-v4-flash-0731** | Simple JSON |
+| Extract "should extract" check | **deepseek-v4-flash-0731** | Binary classification |
+| URL reranking | **deepseek-v4-flash-0731** | Ranking, high volume |
+| URL processor / basic completions | **deepseek-v4-flash-0731** | Simple text |
+| Deep research query generation + planning | **deepseek-v4-flash-0731** | Generating search queries |
+| llms.txt generation | **deepseek-v4-flash-0731** | Titles/descriptions, high volume |
+| Engine picker | **deepseek-v4-flash-0731** | Evaluating scrape quality |
+| Change tracking LLM diff | **deepseek-v4-flash-0731** | Text comparison |
+| Deterministic JSON codegen | **deepseek-v4-flash-0731** | Coding-focused generation |
+| Deterministic JSON askLlm | **deepseek-v4-flash-0731** | Field value extraction |
 
 This is implemented via `getModel()` (uses `MODEL_NAME`) and `getModelFast()` (uses `MODEL_NAME_FAST`) in `generic-ai.ts`.
 
